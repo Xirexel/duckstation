@@ -128,9 +128,11 @@ protected:
     m_draw_mode.SetTexturePageChanged();
   }
   void ClearVRAMDirtyRectangle() { m_vram_dirty_rect.SetInvalid(); }
+  void IncludeVRAMDityRectangle(const Common::Rectangle<u32>& rect);
 
   u32 GetBatchVertexSpace() const { return static_cast<u32>(m_batch_end_vertex_ptr - m_batch_current_vertex_ptr); }
   u32 GetBatchVertexCount() const { return static_cast<u32>(m_batch_current_vertex_ptr - m_batch_start_vertex_ptr); }
+  void EnsureVertexBufferSpace(u32 required_vertices);
 
   bool IsFlushed() const { return m_batch_current_vertex_ptr == m_batch_start_vertex_ptr; }
 
@@ -155,12 +157,12 @@ protected:
   BatchVertex* m_batch_start_vertex_ptr = nullptr;
   BatchVertex* m_batch_end_vertex_ptr = nullptr;
   BatchVertex* m_batch_current_vertex_ptr = nullptr;
-  BatchVertex m_batch_last_vertex = {};
   u32 m_batch_base_vertex = 0;
 
   u32 m_resolution_scale = 1;
   u32 m_max_resolution_scale = 1;
-  bool m_true_color = false;
+  bool m_true_color = true;
+  bool m_scaled_dithering = false;
   bool m_texture_filtering = false;
   bool m_supports_dual_source_blend = false;
 
@@ -187,13 +189,19 @@ private:
   static BatchPrimitive GetPrimitiveForCommand(RenderCommand rc);
 
   void LoadVertices(RenderCommand rc, u32 num_vertices, const u32* command_ptr);
-  void AddDuplicateVertex();
 
-  template<typename... Args>
-  ALWAYS_INLINE void AddVertex(Args&&... args)
+  ALWAYS_INLINE void AddVertex(const BatchVertex& v)
   {
-    m_batch_last_vertex.Set(std::forward<Args>(args)...);
-    std::memcpy(m_batch_current_vertex_ptr, &m_batch_last_vertex, sizeof(BatchVertex));
+    std::memcpy(m_batch_current_vertex_ptr, &v, sizeof(BatchVertex));
     m_batch_current_vertex_ptr++;
   }
+
+  template<typename... Args>
+  ALWAYS_INLINE void AddNewVertex(Args&&... args)
+  {
+    m_batch_current_vertex_ptr->Set(std::forward<Args>(args)...);
+    m_batch_current_vertex_ptr++;
+  }
+
+  void PrintSettingsToLog();
 };

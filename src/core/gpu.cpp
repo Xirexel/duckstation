@@ -3,6 +3,7 @@
 #include "common/log.h"
 #include "common/state_wrapper.h"
 #include "dma.h"
+#include "host_display.h"
 #include "host_interface.h"
 #include "interrupt_controller.h"
 #include "stb_image_write.h"
@@ -26,7 +27,7 @@ bool GPU::Initialize(HostDisplay* host_display, System* system, DMA* dma, Interr
   m_dma = dma;
   m_interrupt_controller = interrupt_controller;
   m_timers = timers;
-  m_force_progressive_scan = m_system->GetSettings().gpu_force_progressive_scan;
+  m_force_progressive_scan = m_system->GetSettings().display_force_progressive_scan;
   m_tick_event =
     m_system->CreateTimingEvent("GPU Tick", 1, 1, std::bind(&GPU::Execute, this, std::placeholders::_1), true);
   return true;
@@ -34,7 +35,8 @@ bool GPU::Initialize(HostDisplay* host_display, System* system, DMA* dma, Interr
 
 void GPU::UpdateSettings()
 {
-  m_force_progressive_scan = m_system->GetSettings().gpu_force_progressive_scan;
+  m_force_progressive_scan = m_system->GetSettings().display_force_progressive_scan;
+  UpdateCRTCConfig();
 }
 
 void GPU::Reset()
@@ -63,7 +65,7 @@ void GPU::SoftReset()
   SetDrawMode(0);
   SetTexturePalette(0);
   m_draw_mode.SetTextureWindow(0);
-  UpdateGPUSTAT();
+  UpdateDMARequest();
   UpdateCRTCConfig();
 
   m_tick_event->Deactivate();
@@ -108,8 +110,12 @@ bool GPU::DoState(StateWrapper& sw)
   sw.Do(&m_crtc_state.regs.horizontal_display_range);
   sw.Do(&m_crtc_state.regs.vertical_display_range);
   sw.Do(&m_crtc_state.dot_clock_divider);
-  sw.Do(&m_crtc_state.display_width);
-  sw.Do(&m_crtc_state.display_height);
+  sw.Do(&m_crtc_state.visible_display_width);
+  sw.Do(&m_crtc_state.visible_display_height);
+  sw.Do(&m_crtc_state.active_display_left);
+  sw.Do(&m_crtc_state.active_display_top);
+  sw.Do(&m_crtc_state.active_display_width);
+  sw.Do(&m_crtc_state.active_display_height);
   sw.Do(&m_crtc_state.horizontal_total);
   sw.Do(&m_crtc_state.horizontal_display_start);
   sw.Do(&m_crtc_state.horizontal_display_end);
@@ -123,6 +129,9 @@ bool GPU::DoState(StateWrapper& sw)
   sw.Do(&m_crtc_state.in_hblank);
   sw.Do(&m_crtc_state.in_vblank);
 
+  sw.Do(&m_state);
+  sw.Do(&m_blitter_ticks);
+  sw.Do(&m_command_total_words);
   sw.Do(&m_GPUREAD_latch);
 
   sw.Do(&m_vram_transfer.x);
@@ -140,7 +149,7 @@ bool GPU::DoState(StateWrapper& sw)
     m_draw_mode.texture_window_changed = true;
     m_drawing_area_changed = true;
     m_drawing_offset_changed = true;
-    UpdateGPUSTAT();
+    UpdateDMARequest();
   }
 
   if (!sw.DoMarker("GPU-VRAM"))
@@ -161,6 +170,7 @@ bool GPU::DoState(StateWrapper& sw)
     // Restore mask setting.
     m_GPUSTAT.bits = old_GPUSTAT;
 
+    UpdateCRTCConfig();
     UpdateDisplay();
     UpdateSliceTicks();
   }
@@ -177,12 +187,18 @@ void GPU::ResetGraphicsAPIState() {}
 
 void GPU::RestoreGraphicsAPIState() {}
 
-void GPU::UpdateGPUSTAT()
+void GPU::UpdateDMARequest()
 {
-  m_GPUSTAT.ready_to_send_vram = (m_state == State::ReadingVRAM);
-  m_GPUSTAT.ready_to_recieve_cmd = (m_state == State::Idle);
+  // we can kill the blitter ticks here if enough time has passed
+  if (m_blitter_ticks > 0 && GetPendingGPUTicks() >= m_blitter_ticks)
+    m_blitter_ticks = 0;
+
+  const bool blitter_idle = (m_blitter_ticks <= 0);
+
+  m_GPUSTAT.ready_to_send_vram = (blitter_idle && m_state == State::ReadingVRAM);
+  m_GPUSTAT.ready_to_recieve_cmd = (blitter_idle && m_state == State::Idle);
   m_GPUSTAT.ready_to_recieve_dma =
-    (m_state == State::Idle || (m_state != State::ReadingVRAM && m_command_total_words > 0));
+    blitter_idle && (m_state == State::Idle || (m_state != State::ReadingVRAM && m_command_total_words > 0));
 
   bool dma_request;
   switch (m_GPUSTAT.dma_direction)
@@ -192,15 +208,15 @@ void GPU::UpdateGPUSTAT()
       break;
 
     case DMADirection::FIFO:
-      dma_request = true; // FIFO not full/full
+      dma_request = blitter_idle && m_state >= State::ReadingVRAM; // FIFO not full/full
       break;
 
     case DMADirection::CPUtoGP0:
-      dma_request = m_GPUSTAT.ready_to_recieve_dma;
+      dma_request = blitter_idle && m_GPUSTAT.ready_to_recieve_dma;
       break;
 
     case DMADirection::GPUREADtoCPU:
-      dma_request = m_GPUSTAT.ready_to_send_vram;
+      dma_request = blitter_idle && m_GPUSTAT.ready_to_send_vram;
       break;
 
     default:
@@ -219,7 +235,14 @@ u32 GPU::ReadRegister(u32 offset)
       return ReadGPUREAD();
 
     case 0x04:
+    {
+      // code can be dependent on the odd/even bit, so update the GPU state when reading.
+      // we can mitigate this slightly by only updating when the raster is actually hitting a new line
+      if (IsRasterScanlinePending())
+        m_tick_event->InvokeEarly(true);
+
       return m_GPUSTAT.bits;
+    }
 
     default:
       Log_ErrorPrintf("Unhandled register read: %02X", offset);
@@ -266,6 +289,13 @@ void GPU::DMAWrite(const u32* words, u32 word_count)
     {
       std::copy(words, words + word_count, std::back_inserter(m_GP0_buffer));
       ExecuteCommands();
+
+      if (m_state == State::WritingVRAM)
+      {
+        m_blitter_ticks += word_count;
+        UpdateDMARequest();
+        UpdateSliceTicks();
+      }
     }
     break;
 
@@ -285,8 +315,9 @@ void GPU::Synchronize()
 
 void GPU::UpdateCRTCConfig()
 {
-  static constexpr std::array<TickCount, 8> dot_clock_dividers = {{10, 8, 5, 4, 7, 7, 7, 7}};
+  static constexpr std::array<u16, 8> dot_clock_dividers = {{10, 8, 5, 4, 7, 7, 7, 7}};
   CRTCState& cs = m_crtc_state;
+  const DisplayCropMode crop_mode = m_system->GetSettings().display_crop_mode;
 
   if (m_GPUSTAT.pal_mode)
   {
@@ -300,9 +331,10 @@ void GPU::UpdateCRTCConfig()
   }
 
   const TickCount ticks_per_frame = cs.horizontal_total * cs.vertical_total;
-  const double vertical_frequency =
-    static_cast<double>((u64(MASTER_CLOCK) * 11) / 7) / static_cast<double>(ticks_per_frame);
-  m_system->GetHostInterface()->SetThrottleFrequency(vertical_frequency);
+  const float vertical_frequency =
+    static_cast<float>(static_cast<double>((u64(MASTER_CLOCK) * 11) / 7) / static_cast<double>(ticks_per_frame));
+  m_system->SetThrottleFrequency(vertical_frequency);
+  m_tick_event->SetInterval(cs.horizontal_total);
 
   const u8 horizontal_resolution_index = m_GPUSTAT.horizontal_resolution_1 | (m_GPUSTAT.horizontal_resolution_2 << 2);
   cs.dot_clock_divider = dot_clock_dividers[horizontal_resolution_index];
@@ -311,96 +343,148 @@ void GPU::UpdateCRTCConfig()
   cs.vertical_display_start = static_cast<TickCount>(std::min<u32>(cs.regs.Y1, cs.vertical_total));
   cs.vertical_display_end = static_cast<TickCount>(std::min<u32>(cs.regs.Y2, cs.vertical_total));
 
-  // check for a change in resolution
-  const u32 old_horizontal_resolution = cs.display_width;
-  const u32 old_vertical_resolution = cs.display_height;
-  const u32 visible_lines = cs.regs.Y2 - cs.regs.Y1;
-  cs.display_width = std::max<u32>((cs.regs.X2 - cs.regs.X1) / cs.dot_clock_divider, 1);
-  cs.display_height = visible_lines << BoolToUInt8(m_GPUSTAT.In480iMode());
+  // determine the active display size
+  cs.active_display_width = std::clamp<u16>((cs.regs.X2 - cs.regs.X1) / cs.dot_clock_divider, 1, VRAM_WIDTH);
+  cs.active_display_height =
+    std::clamp<u16>((cs.regs.Y2 - cs.regs.Y1), 1, VRAM_HEIGHT >> BoolToUInt8(m_GPUSTAT.In480iMode()));
 
-  if (cs.display_width != old_horizontal_resolution || cs.display_height != old_vertical_resolution)
-    Log_InfoPrintf("Visible resolution is now %ux%u", cs.display_width, cs.display_height);
+  // Construct screen borders from configured active area and the standard visible range.
+  // TODO: Ensure it doesn't overflow
+  const u16 horizontal_start_display_tick = (crop_mode == DisplayCropMode::None ? 488 : 608);
+  const u16 horizontal_end_display_tick = (crop_mode == DisplayCropMode::None ? 2800 : 2560);
+  cs.visible_display_width = horizontal_end_display_tick / cs.dot_clock_divider;
+  cs.active_display_left =
+    (std::max<u16>(m_crtc_state.regs.X1, horizontal_start_display_tick) - horizontal_start_display_tick) /
+    cs.dot_clock_divider;
 
-  // Compute the aspect ratio necessary to display borders in the inactive region of the picture.
-  // Convert total dots/lines to time.
-  const float dot_clock =
-    (static_cast<float>(MASTER_CLOCK) * (11.0f / 7.0f / static_cast<float>(cs.dot_clock_divider)));
-  const float dot_clock_period = 1.0f / dot_clock;
-  const float dots_per_scanline = static_cast<float>(cs.horizontal_total) / static_cast<float>(cs.dot_clock_divider);
-  const float horizontal_period = dots_per_scanline * dot_clock_period;
-  const float vertical_period = horizontal_period * static_cast<float>(cs.vertical_total);
+  const u16 vertical_start_display_line = (crop_mode == DisplayCropMode::None ? 8 : (m_GPUSTAT.pal_mode ? 20 : 16));
+  const u16 vertical_end_display_line =
+    (crop_mode == DisplayCropMode::None ? static_cast<u16>(cs.vertical_total) :
+                                          static_cast<u16>(m_GPUSTAT.pal_mode ? 308 : 256));
+  const u16 bottom_padding = vertical_end_display_line - std::min<u16>(m_crtc_state.regs.Y2, vertical_end_display_line);
+  cs.active_display_top =
+    std::max<u16>(m_crtc_state.regs.Y1, vertical_start_display_line) - vertical_start_display_line;
+  cs.visible_display_height = cs.active_display_top + cs.active_display_height + bottom_padding;
 
-  // Convert active dots/lines to time.
-  const float visible_dots_per_scanline = static_cast<float>(cs.display_width);
-  const float horizontal_active_time = horizontal_period * visible_dots_per_scanline;
-  const float vertical_active_time = horizontal_active_time * static_cast<float>(visible_lines);
+  // Aspect ratio is always 4:3.
+  cs.display_aspect_ratio = 4.0f / 3.0f;
 
-  // Use the reference active time/lines for the signal to work out the border area, and thus aspect ratio
-  // transformation for the active area in our framebuffer. For the purposes of these calculations, we're assuming
-  // progressive scan.
-  float display_ratio;
-  if (m_GPUSTAT.pal_mode)
+  if (crop_mode == DisplayCropMode::Borders)
   {
-    // Wikipedia says PAL is active 51.95us of 64.00us, and 576/625 lines.
-    const float signal_horizontal_active_time = 51.95f;
-    const float signal_horizontal_total_time = 64.0f;
-    const float signal_vertical_active_lines = 576.0f;
-    const float signal_vertical_total_lines = 625.0f;
-    const float h_ratio =
-      (horizontal_active_time / horizontal_period) * (signal_horizontal_total_time / signal_horizontal_active_time);
-    const float v_ratio =
-      (vertical_active_time / vertical_period) * (signal_vertical_total_lines / signal_vertical_active_lines);
-    display_ratio = h_ratio / v_ratio;
-  }
-  else
-  {
-    const float signal_horizontal_active_time = 52.66f;
-    const float signal_horizontal_total_time = 63.56f;
-    const float signal_vertical_active_lines = 486.0f;
-    const float signal_vertical_total_lines = 525.0f;
-    const float h_ratio =
-      (horizontal_active_time / horizontal_period) * (signal_horizontal_total_time / signal_horizontal_active_time);
-    const float v_ratio =
-      (vertical_active_time / vertical_period) * (signal_vertical_total_lines / signal_vertical_active_lines);
-    display_ratio = h_ratio / v_ratio;
+    // Compute the aspect ratio necessary to display borders in the inactive region of the picture.
+    // Convert total dots/lines to time.
+    const float dot_clock =
+      (static_cast<float>(MASTER_CLOCK) * (11.0f / 7.0f / static_cast<float>(cs.dot_clock_divider)));
+    const float dot_clock_period = 1.0f / dot_clock;
+    const float dots_per_scanline = static_cast<float>(cs.horizontal_total) / static_cast<float>(cs.dot_clock_divider);
+    const float horizontal_period = dots_per_scanline * dot_clock_period;
+    const float vertical_period = horizontal_period * static_cast<float>(cs.vertical_total);
+
+    // Convert active dots/lines to time.
+    const float visible_dots_per_scanline = static_cast<float>(cs.active_display_width);
+    const float horizontal_active_time = horizontal_period * visible_dots_per_scanline;
+    const float vertical_active_time = horizontal_active_time * static_cast<float>(cs.regs.Y2 - cs.regs.Y1);
+
+    // Use the reference active time/lines for the signal to work out the border area, and thus aspect ratio
+    // transformation for the active area in our framebuffer. For the purposes of these calculations, we're assuming
+    // progressive scan.
+    float display_ratio;
+    if (m_GPUSTAT.pal_mode)
+    {
+      // Wikipedia says PAL is active 51.95us of 64.00us, and 576/625 lines.
+      const float signal_horizontal_active_time = 51.95f;
+      const float signal_horizontal_total_time = 64.0f;
+      const float signal_vertical_active_lines = 576.0f;
+      const float signal_vertical_total_lines = 625.0f;
+      const float h_ratio =
+        (horizontal_active_time / horizontal_period) * (signal_horizontal_total_time / signal_horizontal_active_time);
+      const float v_ratio =
+        (vertical_active_time / vertical_period) * (signal_vertical_total_lines / signal_vertical_active_lines);
+      display_ratio = h_ratio / v_ratio;
+    }
+    else
+    {
+      const float signal_horizontal_active_time = 52.66f;
+      const float signal_horizontal_total_time = 63.56f;
+      const float signal_vertical_active_lines = 486.0f;
+      const float signal_vertical_total_lines = 525.0f;
+      const float h_ratio =
+        (horizontal_active_time / horizontal_period) * (signal_horizontal_total_time / signal_horizontal_active_time);
+      const float v_ratio =
+        (vertical_active_time / vertical_period) * (signal_vertical_total_lines / signal_vertical_active_lines);
+      display_ratio = h_ratio / v_ratio;
+    }
+
+    // Ensure the numbers are sane, and not due to a misconfigured active display range.
+    cs.display_aspect_ratio = (std::isnormal(display_ratio) && display_ratio != 0.0f) ? display_ratio : (4.0f / 3.0f);
+    cs.visible_display_width = cs.active_display_width;
+    cs.visible_display_height = cs.active_display_height;
+    cs.active_display_left = 0;
+    cs.active_display_top = 0;
   }
 
-  // Ensure the numbers are sane, and not due to a misconfigured active display range.
-  cs.display_aspect_ratio = (std::isnormal(display_ratio) && display_ratio != 0.0f) ? display_ratio : (4.0f / 3.0f);
-  m_tick_event->SetInterval(cs.horizontal_total);
+  Log_DevPrintf("Screen resolution: %ux%u", cs.visible_display_width, cs.visible_display_height);
+  Log_DevPrintf("Active display: %ux%u @ %u,%u (VRAM %u,%u)", cs.active_display_width, cs.active_display_height,
+                cs.active_display_left, cs.active_display_top, cs.regs.X.GetValue(), cs.regs.Y.GetValue());
+  Log_DevPrintf("Padding: Left=%u, Top=%u, Right=%u, Bottom=%u", cs.active_display_left, cs.active_display_top,
+                cs.visible_display_width - cs.active_display_width - cs.active_display_left,
+                cs.visible_display_height - cs.active_display_height - cs.active_display_top);
 }
 
-static TickCount GPUTicksToSystemTicks(u32 gpu_ticks)
+static TickCount GPUTicksToSystemTicks(TickCount gpu_ticks)
 {
   // convert to master clock, rounding up as we want to overshoot not undershoot
-  return (gpu_ticks * 7 + 10) / 11;
+  return static_cast<TickCount>((static_cast<u32>(gpu_ticks) * 7u + 10u) / 11u);
+}
+
+TickCount GPU::GetPendingGPUTicks() const
+{
+  const TickCount pending_sysclk_ticks = m_tick_event->GetTicksSinceLastExecution();
+  return ((pending_sysclk_ticks * 11) + m_crtc_state.fractional_ticks) / 7;
 }
 
 void GPU::UpdateSliceTicks()
 {
   // figure out how many GPU ticks until the next vblank
-  const u32 lines_until_vblank =
+  const TickCount lines_until_vblank =
     (m_crtc_state.current_scanline >= m_crtc_state.vertical_display_end ?
        (m_crtc_state.vertical_total - m_crtc_state.current_scanline + m_crtc_state.vertical_display_end) :
        (m_crtc_state.vertical_display_end - m_crtc_state.current_scanline));
-  const u32 ticks_until_vblank =
+  const TickCount ticks_until_vblank =
     lines_until_vblank * m_crtc_state.horizontal_total - m_crtc_state.current_tick_in_scanline;
-  const u32 ticks_until_hblank =
+  const TickCount ticks_until_hblank =
     (m_crtc_state.current_tick_in_scanline >= m_crtc_state.horizontal_display_end) ?
       (m_crtc_state.horizontal_total - m_crtc_state.current_tick_in_scanline + m_crtc_state.horizontal_display_end) :
       (m_crtc_state.horizontal_display_end - m_crtc_state.current_tick_in_scanline);
 
-  m_tick_event->Schedule(GPUTicksToSystemTicks(ticks_until_vblank));
+  m_tick_event->Schedule(
+    GPUTicksToSystemTicks((m_blitter_ticks > 0) ? std::min(m_blitter_ticks, ticks_until_vblank) : ticks_until_vblank));
   m_tick_event->SetPeriod(GPUTicksToSystemTicks(ticks_until_hblank));
+}
+
+bool GPU::IsRasterScanlinePending() const
+{
+  return (GetPendingGPUTicks() + m_crtc_state.current_tick_in_scanline) >= m_crtc_state.horizontal_total;
 }
 
 void GPU::Execute(TickCount ticks)
 {
   // convert cpu/master clock to GPU ticks, accounting for partial cycles because of the non-integer divider
   {
-    const TickCount temp = (ticks * 11) + m_crtc_state.fractional_ticks;
-    m_crtc_state.current_tick_in_scanline += temp / 7;
-    m_crtc_state.fractional_ticks = temp % 7;
+    const TickCount ticks_mul_11 = (ticks * 11) + m_crtc_state.fractional_ticks;
+    const TickCount gpu_ticks = ticks_mul_11 / 7;
+    m_crtc_state.fractional_ticks = ticks_mul_11 % 7;
+    m_crtc_state.current_tick_in_scanline += gpu_ticks;
+
+    if (m_blitter_ticks > 0)
+    {
+      m_blitter_ticks -= gpu_ticks;
+      if (m_blitter_ticks <= 0)
+      {
+        m_blitter_ticks = 0;
+        UpdateDMARequest();
+      }
+    }
   }
 
   if (m_crtc_state.current_tick_in_scanline < m_crtc_state.horizontal_total)
@@ -526,7 +610,7 @@ u32 GPU::ReadGPUREAD()
         Log_DebugPrintf("End of VRAM->CPU transfer");
         m_vram_transfer = {};
         m_state = State::Idle;
-        UpdateGPUSTAT();
+        UpdateDMARequest();
 
         // end of transfer, catch up on any commands which were written (unlikely)
         ExecuteCommands();
@@ -565,7 +649,7 @@ void GPU::WriteGP1(u32 value)
       m_command_total_words = 0;
       m_vram_transfer = {};
       m_GP0_buffer.clear();
-      UpdateGPUSTAT();
+      UpdateDMARequest();
     }
     break;
 
@@ -581,6 +665,7 @@ void GPU::WriteGP1(u32 value)
       const bool disable = ConvertToBoolUnchecked(value & 0x01);
       Log_DebugPrintf("Display %s", disable ? "disabled" : "enabled");
       m_GPUSTAT.display_disable = disable;
+      UpdateCRTCConfig();
     }
     break;
 
@@ -588,7 +673,7 @@ void GPU::WriteGP1(u32 value)
     {
       m_GPUSTAT.dma_direction = static_cast<DMADirection>(param);
       Log_DebugPrintf("DMA direction <- 0x%02X", static_cast<u32>(m_GPUSTAT.dma_direction.GetValue()));
-      UpdateGPUSTAT();
+      UpdateDMARequest();
     }
     break;
 
@@ -750,7 +835,12 @@ void GPU::UpdateDisplay() {}
 
 void GPU::ReadVRAM(u32 x, u32 y, u32 width, u32 height) {}
 
-void GPU::FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color) {}
+void GPU::FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color)
+{
+  const u16 color16 = RGBA8888ToRGBA5551(color);
+  for (u32 yoffs = 0; yoffs < height; yoffs++)
+    std::fill_n(&m_vram_ptr[((y + yoffs) * VRAM_WIDTH) + x], width, color16);
+}
 
 void GPU::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data)
 {
@@ -780,14 +870,33 @@ void GPU::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data)
       {
         // TODO: Handle unaligned reads...
         u16* pixel_ptr = &dst_row_ptr[(x + col++) % VRAM_WIDTH];
-        if (((*pixel_ptr) & mask_and) == mask_and)
+        if (((*pixel_ptr) & mask_and) == 0)
           *pixel_ptr = *(src_ptr++) | mask_or;
       }
     }
   }
 }
 
-void GPU::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) {}
+void GPU::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height)
+{
+  // This doesn't have a fast path, but do we really need one? It's not common.
+  const u16 mask_and = m_GPUSTAT.GetMaskAND();
+  const u16 mask_or = m_GPUSTAT.GetMaskOR();
+
+  for (u32 row = 0; row < height; row++)
+  {
+    const u16* src_row_ptr = &m_vram_ptr[((src_y + row) % VRAM_HEIGHT) * VRAM_WIDTH];
+    u16* dst_row_ptr = &m_vram_ptr[((dst_y + row) % VRAM_HEIGHT) * VRAM_WIDTH];
+
+    for (u32 col = 0; col < width; col++)
+    {
+      const u16 src_pixel = src_row_ptr[(src_x + col) % VRAM_WIDTH];
+      u16* dst_pixel_ptr = &dst_row_ptr[(dst_x + col) % VRAM_WIDTH];
+      if ((*dst_pixel_ptr & mask_and) == 0)
+        *dst_pixel_ptr = src_pixel | mask_or;
+    }
+  }
+}
 
 void GPU::DispatchRenderCommand(RenderCommand rc, u32 num_vertices, const u32* command_ptr) {}
 
@@ -869,7 +978,9 @@ bool GPU::DumpVRAMToFile(const char* filename, u32 width, u32 height, u32 stride
 
 void GPU::DrawDebugStateWindow()
 {
-  ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
+  ImGui::SetNextWindowSize(ImVec2(450.0f * framebuffer_scale, 550.0f * framebuffer_scale), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("GPU", &m_system->GetSettings().debugging.show_gpu_state))
   {
     ImGui::End();
@@ -888,7 +999,7 @@ void GPU::DrawDebugStateWindow()
     const Stats& stats = m_last_stats;
 
     ImGui::Columns(2);
-    ImGui::SetColumnWidth(0, 200.0f);
+    ImGui::SetColumnWidth(0, 200.0f * framebuffer_scale);
 
     ImGui::TextUnformatted("Idle Frame: ");
     ImGui::NextColumn();
@@ -938,7 +1049,7 @@ void GPU::DrawDebugStateWindow()
                 m_GPUSTAT.interlaced_field ? "odd" : "even");
     ImGui::Text("Display Disable: %s", m_GPUSTAT.display_disable ? "Yes" : "No");
     ImGui::Text("Drawing Even Line: %s", m_GPUSTAT.drawing_even_line ? "Yes" : "No");
-    ImGui::Text("Display Resolution: %ux%u", cs.display_width, cs.display_height);
+    ImGui::Text("Display Resolution: %ux%u", cs.active_display_width, cs.active_display_height);
     ImGui::Text("Color Depth: %u-bit", m_GPUSTAT.display_area_color_depth_24 ? 24 : 15);
     ImGui::Text("Start Offset: (%u, %u)", cs.regs.X.GetValue(), cs.regs.Y.GetValue());
     ImGui::Text("Display Total: %u (%u) horizontal, %u vertical", cs.horizontal_total,

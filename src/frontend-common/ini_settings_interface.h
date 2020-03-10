@@ -3,11 +3,13 @@
 
 #include "SimpleIni.h"
 
-class SDLSettingsInterface : public SettingsInterface
+class INISettingsInterface : public SettingsInterface
 {
 public:
-  SDLSettingsInterface(const char* filename);
-  ~SDLSettingsInterface();
+  INISettingsInterface(const char* filename);
+  ~INISettingsInterface();
+
+  void Clear() override;
 
   int GetIntValue(const char* section, const char* key, int default_value = 0) override;
   float GetFloatValue(const char* section, const char* key, float default_value = 0.0f) override;
@@ -28,4 +30,5 @@ public:
 private:
   std::string m_filename;
   CSimpleIniA m_ini;
+  bool m_dirty = false;
 };

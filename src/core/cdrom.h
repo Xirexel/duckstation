@@ -4,6 +4,7 @@
 #include "common/cd_xa.h"
 #include "common/fifo_queue.h"
 #include "common/heap_array.h"
+#include "cdrom_async_reader.h"
 #include "types.h"
 #include <array>
 #include <string>
@@ -27,7 +28,7 @@ public:
   void Reset();
   bool DoState(StateWrapper& sw);
 
-  bool HasMedia() const { return static_cast<bool>(m_media); }
+  bool HasMedia() const;
   std::string GetMediaFileName() const;
   void InsertMedia(std::unique_ptr<CDImage> media);
   void RemoveMedia();
@@ -39,6 +40,8 @@ public:
 
   // Render statistics debug window.
   void DrawDebugWindow();
+
+  void SetUseReadThread(bool enabled);
 
 private:
   enum : u32
@@ -61,11 +64,11 @@ private:
 
   enum class Interrupt : u8
   {
-    INT1 = 0x01,
-    INT2 = 0x02,
+    DataReady = 0x01,
+    Complete = 0x02,
     ACK = 0x03,
-    INT4 = 0x04,
-    INT5 = 0x05
+    DataEnd = 0x04,
+    Error = 0x05
   };
 
   enum class Command : u16
@@ -117,7 +120,8 @@ private:
     Reading,
     Playing,
     Pausing,
-    Stopping
+    Stopping,
+    ChangingSession
   };
 
   union StatusRegister
@@ -130,6 +134,18 @@ private:
     BitField<u8, bool, 5, 1> RSLRRDY;
     BitField<u8, bool, 6, 1> DRQSTS;
     BitField<u8, bool, 7, 1> BUSYSTS;
+  };
+
+  enum StatBits : u8
+  {
+    STAT_ERROR = (1 << 0),
+    STAT_MOTOR_ON = (1 << 1),
+    STAT_SEEK_ERROR = (1 << 2),
+    STAT_ID_ERROR = (1 << 3),
+    STAT_SHELL_OPEN = (1 << 4),
+    STAT_HEADER_VALID = (1 << 5),
+    STAT_SEEKING = (1 << 6),
+    STAT_PLAYING_CDDA = (1 << 7)
   };
 
   union SecondaryStatusRegister
@@ -147,9 +163,7 @@ private:
     /// Clears the CDDA/seeking/header valid bits.
     ALWAYS_INLINE void ClearActiveBits()
     {
-      header_valid = false;
-      seeking = false;
-      playing_cdda = false;
+      bits &= ~(STAT_HEADER_VALID | STAT_SEEKING | STAT_PLAYING_CDDA);
     }
   };
 
@@ -185,8 +199,8 @@ private:
   void ClearAsyncInterrupt();
   void DeliverAsyncInterrupt();
   void SendACKAndStat();
-  void SendErrorResponse(u8 reason = 0x80);
-  void SendAsyncErrorResponse(u8 reason = 0x80);
+  void SendErrorResponse(u8 stat_bits = STAT_ERROR, u8 reason = 0x80);
+  void SendAsyncErrorResponse(u8 stat_bits = STAT_ERROR, u8 reason = 0x80);
   void UpdateStatusRegister();
   void UpdateInterruptRequest();
 
@@ -205,6 +219,7 @@ private:
   void DoSeekComplete(TickCount ticks_late);
   void DoPauseComplete();
   void DoStopComplete();
+  void DoChangeSessionComplete();
   void DoIDRead();
   void DoTOCRead();
   void DoSectorRead();
@@ -219,7 +234,6 @@ private:
   DMA* m_dma = nullptr;
   InterruptController* m_interrupt_controller = nullptr;
   SPU* m_spu = nullptr;
-  std::unique_ptr<CDImage> m_media;
   std::unique_ptr<TimingEvent> m_command_event;
   std::unique_ptr<TimingEvent> m_drive_event;
 
@@ -235,7 +249,7 @@ private:
   u8 m_pending_async_interrupt = 0;
 
   CDImage::Position m_setloc_position = {};
-  CDImage::Position m_seek_position = {};
+  CDImage::LBA m_last_requested_sector{};
   bool m_setloc_pending = false;
   bool m_read_after_seek = false;
   bool m_play_after_seek = false;
@@ -250,7 +264,9 @@ private:
   CDXA::XASubHeader m_last_sector_subheader{};
   CDImage::SubChannelQ m_last_subq{};
   u8 m_last_cdda_report_frame_nibble = 0xFF;
+  u8 m_cdda_report_delay = 0x00;
   u8 m_play_track_number_bcd = 0xFF;
+  u8 m_async_command_parameter = 0x00;
 
   std::array<std::array<u8, 2>, 2> m_cd_audio_volume_matrix{};
   std::array<std::array<u8, 2>, 2> m_next_cd_audio_volume_matrix{};
@@ -265,4 +281,6 @@ private:
   InlineFIFOQueue<u8, RESPONSE_FIFO_SIZE> m_async_response_fifo;
   HeapFIFOQueue<u8, DATA_FIFO_SIZE> m_data_fifo;
   std::vector<u8> m_sector_buffer;
+
+  CDROMAsyncReader m_reader;
 };

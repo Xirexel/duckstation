@@ -21,6 +21,7 @@ public:
 
   HostDisplay* getHostDisplayInterface() override;
 
+  bool hasDeviceContext() const override;
   bool createDeviceContext(QThread* worker_thread, bool debug_device) override;
   bool initializeDeviceContext(bool debug_device) override;
   void destroyDeviceContext() override;
@@ -31,6 +32,7 @@ public:
   void* GetRenderWindow() const override;
 
   void ChangeRenderWindow(void* new_window) override;
+  void WindowResized(s32 new_window_width, s32 new_window_height) override;
 
   std::unique_ptr<HostDisplayTexture> CreateTexture(u32 width, u32 height, const void* data, u32 data_stride,
                                                     bool dynamic) override;
@@ -39,12 +41,7 @@ public:
 
   void SetVSync(bool enabled) override;
 
-  std::tuple<u32, u32> GetWindowSize() const override;
-  void WindowResized() override;
-
   void Render() override;
-
-  void onWindowResized(int width, int height) override;
 
 private:
   static constexpr u32 DISPLAY_UNIFORM_BUFFER_SIZE = 16;

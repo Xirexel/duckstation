@@ -22,15 +22,23 @@ public:
   SDLHostInterface();
   ~SDLHostInterface();
 
-  static std::unique_ptr<SDLHostInterface> Create(const char* filename = nullptr, const char* exp1_filename = nullptr,
-                                                  const char* save_state_filename = nullptr);
-
-  static std::string GetSaveStateFilename(u32 index);
+  static std::unique_ptr<SDLHostInterface> Create();
 
   void ReportError(const char* message) override;
   void ReportMessage(const char* message) override;
+  bool ConfirmMessage(const char* message) override;
 
   void Run();
+
+protected:
+  bool AcquireHostDisplay() override;
+  void ReleaseHostDisplay() override;
+  std::unique_ptr<AudioStream> CreateAudioStream(AudioBackend backend) override;
+
+  void OnSystemCreated() override;
+  void OnSystemPaused(bool paused) override;
+  void OnSystemDestroyed();
+  void OnControllerTypeChanged(u32 slot) override;
 
 private:
   enum class KeyboardControllerAction
@@ -62,9 +70,6 @@ private:
     float last_rumble_strength;
   };
 
-  static constexpr u32 NUM_QUICK_SAVE_STATES = 10;
-  static constexpr char RESUME_SAVESTATE_FILENAME[] = "savestate_resume.bin";
-
   bool HasSystem() const { return static_cast<bool>(m_system); }
 
 #ifdef WIN32
@@ -73,47 +78,35 @@ private:
   bool UseOpenGLRenderer() const { return true; }
 #endif
 
+  static float GetDPIScaleFactor(SDL_Window* window);
+
   bool CreateSDLWindow();
   void DestroySDLWindow();
   bool CreateDisplay();
   void DestroyDisplay();
   void CreateImGuiContext();
-  void CreateAudioStream();
+  void UpdateFramebufferScale();
+
+  /// Executes a callback later, after the UI has finished rendering. Needed to boot while rendering ImGui.
+  void RunLater(std::function<void()> callback);
 
   void SaveSettings();
+  void UpdateSettings();
 
-  void QueueSwitchGPURenderer();
-  void SwitchGPURenderer();
-  void SwitchAudioBackend();
-  void UpdateFullscreen();
-  void UpdateControllerMapping();
+  bool IsFullscreen() const { return m_fullscreen; }
+  void SetFullscreen(bool enabled);
 
   // We only pass mouse input through if it's grabbed
   void DrawImGui();
-  void DoPowerOff();
-  void DoResume();
   void DoStartDisc();
-  void DoStartBIOS();
   void DoChangeDisc();
-  void DoLoadState(u32 index);
-  void DoSaveState(u32 index);
-  void DoTogglePause();
   void DoFrameStep();
-  void DoToggleFullscreen();
 
   void HandleSDLEvent(const SDL_Event* event);
   void HandleSDLKeyEvent(const SDL_Event* event);
 
   void UpdateKeyboardControllerMapping();
   bool HandleSDLKeyEventForController(const SDL_Event* event);
-
-  bool OpenGameController(int index);
-  bool CloseGameController(int index);
-  void CloseGameControllers();
-  void UpdateControllerControllerMapping();
-  void HandleSDLControllerAxisEventForController(const SDL_Event* event);
-  void HandleSDLControllerButtonEventForController(const SDL_Event* event);
-  void UpdateControllerRumble();
 
   void DrawMainMenuBar();
   void DrawQuickSettingsMenu();
@@ -122,21 +115,22 @@ private:
   void DrawSettingsWindow();
   void DrawAboutWindow();
   bool DrawFileChooser(const char* label, std::string* path, const char* filter = nullptr);
+  void ClearImGuiFocus();
 
   SDL_Window* m_window = nullptr;
   std::unique_ptr<HostDisplayTexture> m_app_icon_texture;
 
   KeyboardControllerActionMap m_keyboard_button_mapping;
 
-  std::map<int, ControllerData> m_sdl_controllers;
-  std::array<s32, SDL_CONTROLLER_AXIS_MAX> m_controller_axis_mapping;
-  std::array<s32, SDL_CONTROLLER_BUTTON_MAX> m_controller_button_mapping;
+  u32 m_run_later_event_id = 0;
 
-  u32 m_switch_gpu_renderer_event_id = 0;
-
+  bool m_fullscreen = false;
   bool m_quit_request = false;
   bool m_frame_step_request = false;
   bool m_focus_main_menu_bar = false;
   bool m_settings_window_open = false;
   bool m_about_window_open = false;
+
+  // this copy of the settings is modified by imgui
+  Settings m_settings_copy;
 };

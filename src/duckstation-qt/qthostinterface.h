@@ -1,5 +1,7 @@
 #pragma once
 #include "core/host_interface.h"
+#include "core/system.h"
+#include "frontend-common/common_host_interface.h"
 #include "opengldisplaywindow.h"
 #include <QtCore/QByteArray>
 #include <QtCore/QObject>
@@ -16,11 +18,15 @@
 class ByteStream;
 
 class QEventLoop;
+class QMenu;
 class QWidget;
+class QTimer;
 
 class GameList;
 
-class QtHostInterface : public QObject, private HostInterface
+Q_DECLARE_METATYPE(SystemBootParameters);
+
+class QtHostInterface : public QObject, private CommonHostInterface
 {
   Q_OBJECT
 
@@ -30,11 +36,10 @@ public:
 
   void ReportError(const char* message) override;
   void ReportMessage(const char* message) override;
-
-  void setDefaultSettings();
+  bool ConfirmMessage(const char* message) override;
 
   /// Thread-safe QSettings access.
-  QVariant getSettingValue(const QString& name);
+  QVariant getSettingValue(const QString& name, const QVariant& default_value = QVariant());
   void putSettingValue(const QString& name, const QVariant& value);
   void removeSettingValue(const QString& name);
 
@@ -42,64 +47,88 @@ public:
   GameList* getGameList() { return m_game_list.get(); }
   void refreshGameList(bool invalidate_cache = false, bool invalidate_database = false);
 
+  const HotkeyInfoList& getHotkeyInfoList() const { return GetHotkeyInfoList(); }
+
   bool isOnWorkerThread() const { return QThread::currentThread() == m_worker_thread; }
 
-  QWidget* createDisplayWidget(QWidget* parent);
-  bool createDisplayDeviceContext();
-  void displayWidgetDestroyed();
+  QtDisplayWindow* createDisplayWindow();
 
-  void bootSystem(QString initial_filename, QString initial_save_state_filename);
+  void populateSaveStateMenus(const char* game_code, QMenu* load_menu, QMenu* save_menu);
 
-  void updateInputMap();
-  void handleKeyEvent(int key, bool pressed);
-
-  struct HotkeyInfo
-  {
-    QString name;
-    QString display_name;
-    QString category;
-  };
-  std::vector<HotkeyInfo> getHotkeyList() const;
+  /// Fills menu with save state info and handlers.
+  void populateGameListContextMenu(const char* game_code, QWidget* parent_window, QMenu* menu);
 
 Q_SIGNALS:
-  void errorReported(QString message);
-  void messageReported(QString message);
-  void emulationStarting();
+  void errorReported(const QString& message);
+  void messageReported(const QString& message);
+  bool messageConfirmed(const QString& message);
   void emulationStarted();
   void emulationStopped();
   void emulationPaused(bool paused);
+  void stateSaved(const QString& game_code, bool global, qint32 slot);
   void gameListRefreshed();
+  void createDisplayWindowRequested(QThread* worker_thread, bool use_debug_device);
+  void destroyDisplayWindowRequested();
+  void setFullscreenRequested(bool fullscreen);
   void toggleFullscreenRequested();
-  void recreateDisplayWidgetRequested(bool create_device_context);
-  void performanceCountersUpdated(float speed, float fps, float vps, float avg_frame_time, float worst_frame_time);
-  void runningGameChanged(QString filename, QString game_code, QString game_title);
+  void focusDisplayWidgetRequested();
+  void systemPerformanceCountersUpdated(float speed, float fps, float vps, float avg_frame_time,
+                                        float worst_frame_time);
+  void runningGameChanged(const QString& filename, const QString& game_code, const QString& game_title);
 
 public Q_SLOTS:
+  void setDefaultSettings();
   void applySettings();
-  void powerOffSystem(bool save_resume_state = false, bool block_until_done = false);
+  void updateInputMap();
+  void handleKeyEvent(int key, bool pressed);
+  void bootSystem(const SystemBootParameters& params);
+  void resumeSystemFromState(const QString& filename, bool boot_on_failure);
+  void powerOffSystem();
+  void synchronousPowerOffSystem();
   void resetSystem();
   void pauseSystem(bool paused);
-  void changeDisc(QString new_disc_filename);
+  void changeDisc(const QString& new_disc_filename);
+  void loadState(const QString& filename);
+  void loadState(bool global, qint32 slot);
+  void saveState(bool global, qint32 slot, bool block_until_done = false);
+
+  /// Enables controller polling even without a system active. Must be matched by a call to
+  /// disableBackgroundControllerPolling.
+  void enableBackgroundControllerPolling();
+
+  /// Disables background controller polling.
+  void disableBackgroundControllerPolling();
 
 private Q_SLOTS:
   void doStopThread();
-  void doBootSystem(QString initial_filename, QString initial_save_state_filename);
-  void doUpdateInputMap();
-  void doHandleKeyEvent(int key, bool pressed);
   void onDisplayWindowResized(int width, int height);
+  void doBackgroundControllerPoll();
 
 protected:
-  void SwitchGPURenderer() override;
-  void OnPerformanceCountersUpdated() override;
+  bool AcquireHostDisplay() override;
+  void ReleaseHostDisplay() override;
+  void SetFullscreen(bool enabled) override;
+  void ToggleFullscreen() override;
+
+  std::optional<HostKeyCode> GetHostKeyCode(const std::string_view key_code) const override;
+
+  void OnSystemCreated() override;
+  void OnSystemPaused(bool paused) override;
+  void OnSystemDestroyed() override;
+  void OnSystemPerformanceCountersUpdated() override;
   void OnRunningGameChanged() override;
+  void OnSystemStateSaved(bool global, s32 slot) override;
+  void OnControllerTypeChanged(u32 slot) override;
 
 private:
-  using InputButtonHandler = std::function<void(bool)>;
-
   enum : u32
   {
-    NUM_SAVE_STATE_HOTKEYS = 8
+    BACKGROUND_CONTROLLER_POLLING_INTERVAL =
+      100 /// Interval at which the controllers are polled when the system is not active.
   };
+
+  using InputButtonHandler = std::function<void(bool)>;
+  using InputAxisHandler = std::function<void(float)>;
 
   class Thread : public QThread
   {
@@ -114,13 +143,10 @@ private:
     QtHostInterface* m_parent;
   };
 
-  void checkSettings();
-  void updateQSettingsFromCoreSettings();
+  void loadSettings();
+  void createBackgroundControllerPollTimer();
+  void destroyBackgroundControllerPollTimer();
 
-  void updateControllerInputMap();
-  void updateHotkeyInputMap();
-  void addButtonToInputMap(const QString& binding, InputButtonHandler handler);
-  void createAudioStream();
   void createThread();
   void stopThread();
   void threadEntryPoint();
@@ -138,4 +164,7 @@ private:
 
   // input key maps, todo hotkeys
   std::map<int, InputButtonHandler> m_keyboard_input_handlers;
+
+  QTimer* m_background_controller_polling_timer = nullptr;
+  u32 m_background_controller_polling_enable_count = 0;
 };

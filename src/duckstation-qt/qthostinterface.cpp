@@ -8,11 +8,16 @@
 #include "core/game_list.h"
 #include "core/gpu.h"
 #include "core/system.h"
+#include "frontend-common/sdl_audio_stream.h"
+#include "frontend-common/sdl_controller_interface.h"
 #include "qtsettingsinterface.h"
 #include "qtutils.h"
 #include <QtCore/QCoreApplication>
+#include <QtCore/QDateTime>
 #include <QtCore/QDebug>
 #include <QtCore/QEventLoop>
+#include <QtCore/QTimer>
+#include <QtWidgets/QMenu>
 #include <QtWidgets/QMessageBox>
 #include <memory>
 Log_SetChannel(QtHostInterface);
@@ -22,11 +27,13 @@ Log_SetChannel(QtHostInterface);
 #endif
 
 QtHostInterface::QtHostInterface(QObject* parent)
-  : QObject(parent), HostInterface(), m_qsettings(QString::fromStdString(GetSettingsFileName()), QSettings::IniFormat)
+  : QObject(parent), CommonHostInterface(),
+    m_qsettings(QString::fromStdString(GetSettingsFileName()), QSettings::IniFormat)
 {
-  checkSettings();
+  qRegisterMetaType<SystemBootParameters>();
+
+  loadSettings();
   refreshGameList();
-  doUpdateInputMap();
   createThread();
 }
 
@@ -50,36 +57,15 @@ void QtHostInterface::ReportMessage(const char* message)
   emit messageReported(QString::fromLocal8Bit(message));
 }
 
-void QtHostInterface::setDefaultSettings()
+bool QtHostInterface::ConfirmMessage(const char* message)
 {
-  HostInterface::UpdateSettings([this]() {
-    HostInterface::SetDefaultSettings();
-  });
-
-  // default input settings for Qt
-  std::lock_guard<std::mutex> guard(m_qsettings_mutex);
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonUp"), QStringLiteral("Keyboard/W"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonDown"), QStringLiteral("Keyboard/S"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonLeft"), QStringLiteral("Keyboard/A"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonRight"), QStringLiteral("Keyboard/D"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonSelect"), QStringLiteral("Keyboard/Backspace"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonStart"), QStringLiteral("Keyboard/Return"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonTriangle"), QStringLiteral("Keyboard/8"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonCross"), QStringLiteral("Keyboard/2"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonSquare"), QStringLiteral("Keyboard/4"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonCircle"), QStringLiteral("Keyboard/6"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonL1"), QStringLiteral("Keyboard/Q"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonL2"), QStringLiteral("Keyboard/1"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonR1"), QStringLiteral("Keyboard/E"));
-  m_qsettings.setValue(QStringLiteral("Controller1/ButtonR2"), QStringLiteral("Keyboard/3"));
-
-  updateQSettingsFromCoreSettings();
+  return messageConfirmed(QString::fromLocal8Bit(message));
 }
 
-QVariant QtHostInterface::getSettingValue(const QString& name)
+QVariant QtHostInterface::getSettingValue(const QString& name, const QVariant& default_value)
 {
   std::lock_guard<std::mutex> guard(m_qsettings_mutex);
-  return m_qsettings.value(name);
+  return m_qsettings.value(name, default_value);
 }
 
 void QtHostInterface::putSettingValue(const QString& name, const QVariant& value)
@@ -94,10 +80,18 @@ void QtHostInterface::removeSettingValue(const QString& name)
   m_qsettings.remove(name);
 }
 
-void QtHostInterface::updateQSettingsFromCoreSettings()
+void QtHostInterface::setDefaultSettings()
 {
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "setDefaultSettings", Qt::QueuedConnection);
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(m_qsettings_mutex);
   QtSettingsInterface si(m_qsettings);
-  m_settings.Save(si);
+  UpdateSettings([this, &si]() { m_settings.Load(si); });
+  UpdateInputMap(si);
 }
 
 void QtHostInterface::applySettings()
@@ -108,38 +102,28 @@ void QtHostInterface::applySettings()
     return;
   }
 
-  UpdateSettings([this]() {
-    std::lock_guard<std::mutex> guard(m_qsettings_mutex);
-    QtSettingsInterface si(m_qsettings);
-    m_settings.Load(si);
-  });
+  std::lock_guard<std::mutex> guard(m_qsettings_mutex);
+  QtSettingsInterface si(m_qsettings);
+  UpdateSettings([this, &si]() { m_settings.Load(si); });
+  UpdateInputMap(si);
 }
 
-void QtHostInterface::checkSettings()
+void QtHostInterface::loadSettings()
 {
+  // no need to lock here because the emu thread doesn't exist yet
+  QtSettingsInterface si(m_qsettings);
+
   const QSettings::Status settings_status = m_qsettings.status();
   if (settings_status != QSettings::NoError)
-    m_qsettings.clear();
-
-  const QString settings_version_key = QStringLiteral("General/SettingsVersion");
-  const int expected_version = 1;
-  const QVariant settings_version_var = m_qsettings.value(settings_version_key);
-  bool settings_version_okay;
-  int settings_version = settings_version_var.toInt(&settings_version_okay);
-  if (!settings_version_okay)
-    settings_version = 0;
-  if (settings_version != expected_version)
   {
-    Log_WarningPrintf("Settings version %d does not match expected version %d, resetting", settings_version,
-                      expected_version);
     m_qsettings.clear();
-    m_qsettings.setValue(settings_version_key, expected_version);
-    setDefaultSettings();
+    SetDefaultSettings(si);
   }
 
-  // initial setting init - we don't do this locked since the thread hasn't been created yet
-  QtSettingsInterface si(m_qsettings);
+  CheckSettings(si);
   m_settings.Load(si);
+
+  // input map update is done on the emu thread
 }
 
 void QtHostInterface::refreshGameList(bool invalidate_cache /* = false */, bool invalidate_database /* = false */)
@@ -151,8 +135,10 @@ void QtHostInterface::refreshGameList(bool invalidate_cache /* = false */, bool 
   emit gameListRefreshed();
 }
 
-QWidget* QtHostInterface::createDisplayWidget(QWidget* parent)
+QtDisplayWindow* QtHostInterface::createDisplayWindow()
 {
+  Assert(!m_display_window);
+
 #ifdef WIN32
   if (m_settings.gpu_renderer == GPURenderer::HardwareOpenGL)
     m_display_window = new OpenGLDisplayWindow(this, nullptr);
@@ -162,117 +148,154 @@ QWidget* QtHostInterface::createDisplayWidget(QWidget* parent)
   m_display_window = new OpenGLDisplayWindow(this, nullptr);
 #endif
   connect(m_display_window, &QtDisplayWindow::windowResizedEvent, this, &QtHostInterface::onDisplayWindowResized);
-
-  m_display.release();
-  m_display = std::unique_ptr<HostDisplay>(m_display_window->getHostDisplayInterface());
-  m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
-
-  QWidget* widget = QWidget::createWindowContainer(m_display_window, parent);
-  widget->setFocusPolicy(Qt::StrongFocus);
-  return widget;
+  return m_display_window;
 }
 
-bool QtHostInterface::createDisplayDeviceContext()
+void QtHostInterface::bootSystem(const SystemBootParameters& params)
 {
-  return m_display_window->createDeviceContext(m_worker_thread, m_settings.gpu_use_debug_device);
-}
-
-void QtHostInterface::displayWidgetDestroyed()
-{
-  m_display.release();
-  m_display_window = nullptr;
-}
-
-void QtHostInterface::bootSystem(QString initial_filename, QString initial_save_state_filename)
-{
-  Assert(!isOnWorkerThread());
-  emit emulationStarting();
-
-  if (!createDisplayDeviceContext())
+  if (!isOnWorkerThread())
   {
-    emit emulationStopped();
+    QMetaObject::invokeMethod(this, "bootSystem", Qt::QueuedConnection, Q_ARG(const SystemBootParameters&, params));
     return;
   }
 
-  QMetaObject::invokeMethod(this, "doBootSystem", Qt::QueuedConnection, Q_ARG(QString, initial_filename),
-                            Q_ARG(QString, initial_save_state_filename));
+  HostInterface::BootSystem(params);
+}
+
+void QtHostInterface::resumeSystemFromState(const QString& filename, bool boot_on_failure)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "resumeSystemFromState", Qt::QueuedConnection, Q_ARG(const QString&, filename),
+                              Q_ARG(bool, boot_on_failure));
+    return;
+  }
+
+  if (filename.isEmpty())
+    HostInterface::ResumeSystemFromMostRecentState();
+  else
+    HostInterface::ResumeSystemFromState(filename.toStdString().c_str(), boot_on_failure);
 }
 
 void QtHostInterface::handleKeyEvent(int key, bool pressed)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "doHandleKeyEvent", Qt::QueuedConnection, Q_ARG(int, key), Q_ARG(bool, pressed));
+    QMetaObject::invokeMethod(this, "handleKeyEvent", Qt::QueuedConnection, Q_ARG(int, key), Q_ARG(bool, pressed));
     return;
   }
 
-  doHandleKeyEvent(key, pressed);
-}
-
-void QtHostInterface::doHandleKeyEvent(int key, bool pressed)
-{
-  const auto iter = m_keyboard_input_handlers.find(key);
-  if (iter == m_keyboard_input_handlers.end())
-    return;
-
-  iter->second(pressed);
+  HandleHostKeyEvent(key, pressed);
 }
 
 void QtHostInterface::onDisplayWindowResized(int width, int height)
 {
-  m_display_window->onWindowResized(width, height);
+  // this can be null if it was destroyed and the main thread is late catching up
+  if (m_display_window)
+    m_display_window->WindowResized(width, height);
 }
 
-void QtHostInterface::SwitchGPURenderer()
+bool QtHostInterface::AcquireHostDisplay()
 {
-  // Due to the GPU class owning textures, we have to shut the system down.
-  std::unique_ptr<ByteStream> stream;
-  if (m_system)
-  {
-    stream = ByteStream_CreateGrowableMemoryStream(nullptr, 8 * 1024);
-    if (!m_system->SaveState(stream.get()) || !stream->SeekAbsolute(0))
-      ReportError("Failed to save state before GPU renderer switch");
+  DebugAssert(!m_display_window);
 
-    DestroySystem();
-    m_audio_stream->PauseOutput(true);
+  emit createDisplayWindowRequested(m_worker_thread, m_settings.gpu_use_debug_device);
+  if (!m_display_window->hasDeviceContext())
+  {
+    m_display_window = nullptr;
+    emit destroyDisplayWindowRequested();
+    return false;
+  }
+
+  if (!m_display_window->initializeDeviceContext(m_settings.gpu_use_debug_device))
+  {
     m_display_window->destroyDeviceContext();
+    m_display_window = nullptr;
+    emit destroyDisplayWindowRequested();
+    return false;
   }
 
-  const bool restore_state = static_cast<bool>(stream);
-  emit recreateDisplayWidgetRequested(restore_state);
-  Assert(m_display_window != nullptr);
-
-  if (restore_state)
-  {
-    if (!m_display_window->initializeDeviceContext(m_settings.gpu_use_debug_device))
-    {
-      emit runningGameChanged(QString(), QString(), QString());
-      emit emulationStopped();
-      return;
-    }
-
-    CreateSystem();
-    if (!BootSystem(nullptr, nullptr) || !m_system->LoadState(stream.get()))
-    {
-      ReportError("Failed to load state after GPU renderer switch, resetting");
-      m_system->Reset();
-    }
-
-    if (!m_paused)
-    {
-      m_audio_stream->PauseOutput(false);
-      UpdateSpeedLimiterState();
-    }
-  }
-
-  ResetPerformanceCounters();
+  m_display = m_display_window->getHostDisplayInterface();
+  return true;
 }
 
-void QtHostInterface::OnPerformanceCountersUpdated()
+void QtHostInterface::ReleaseHostDisplay()
 {
-  HostInterface::OnPerformanceCountersUpdated();
+  DebugAssert(m_display_window && m_display == m_display_window->getHostDisplayInterface());
+  m_display = nullptr;
+  m_display_window->destroyDeviceContext();
+  m_display_window = nullptr;
+  emit destroyDisplayWindowRequested();
+}
 
-  emit performanceCountersUpdated(m_speed, m_fps, m_vps, m_average_frame_time, m_worst_frame_time);
+void QtHostInterface::SetFullscreen(bool enabled)
+{
+  emit setFullscreenRequested(enabled);
+}
+
+void QtHostInterface::ToggleFullscreen()
+{
+  emit toggleFullscreenRequested();
+}
+
+std::optional<CommonHostInterface::HostKeyCode> QtHostInterface::GetHostKeyCode(const std::string_view key_code) const
+{
+  const std::optional<int> code =
+    QtUtils::ParseKeyString(QString::fromUtf8(key_code.data(), static_cast<int>(key_code.length())));
+  if (!code)
+    return std::nullopt;
+
+  return static_cast<s32>(*code);
+}
+
+void QtHostInterface::OnSystemCreated()
+{
+  HostInterface::OnSystemCreated();
+
+  wakeThread();
+  destroyBackgroundControllerPollTimer();
+
+  emit emulationStarted();
+}
+
+void QtHostInterface::OnSystemPaused(bool paused)
+{
+  HostInterface::OnSystemPaused(paused);
+
+  emit emulationPaused(paused);
+
+  if (m_background_controller_polling_enable_count > 0)
+  {
+    if (paused)
+      createBackgroundControllerPollTimer();
+    else
+      destroyBackgroundControllerPollTimer();
+  }
+
+  if (!paused)
+  {
+    wakeThread();
+    emit focusDisplayWidgetRequested();
+  }
+}
+
+void QtHostInterface::OnSystemDestroyed()
+{
+  HostInterface::OnSystemDestroyed();
+
+  if (m_background_controller_polling_enable_count > 0)
+    createBackgroundControllerPollTimer();
+
+  emit emulationStopped();
+}
+
+void QtHostInterface::OnSystemPerformanceCountersUpdated()
+{
+  HostInterface::OnSystemPerformanceCountersUpdated();
+
+  DebugAssert(m_system);
+  emit systemPerformanceCountersUpdated(m_system->GetEmulationSpeed(), m_system->GetFPS(), m_system->GetVPS(),
+                                        m_system->GetAverageFrameTime(), m_system->GetWorstFrameTime());
 }
 
 void QtHostInterface::OnRunningGameChanged()
@@ -291,178 +314,56 @@ void QtHostInterface::OnRunningGameChanged()
   }
 }
 
+void QtHostInterface::OnSystemStateSaved(bool global, s32 slot)
+{
+  emit stateSaved(QString::fromStdString(m_system->GetRunningCode()), global, slot);
+}
+
+void QtHostInterface::OnControllerTypeChanged(u32 slot)
+{
+  HostInterface::OnControllerTypeChanged(slot);
+
+  // this assumes the settings mutex is already locked - as it comes from updateSettings().
+  QtSettingsInterface si(m_qsettings);
+  UpdateInputMap(si);
+}
+
 void QtHostInterface::updateInputMap()
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "doUpdateInputMap", Qt::QueuedConnection);
+    QMetaObject::invokeMethod(this, "updateInputMap", Qt::QueuedConnection);
     return;
   }
 
-  doUpdateInputMap();
+  std::lock_guard<std::mutex> lock(m_qsettings_mutex);
+  QtSettingsInterface si(m_qsettings);
+  UpdateInputMap(si);
 }
 
-void QtHostInterface::doUpdateInputMap()
-{
-  m_keyboard_input_handlers.clear();
-
-  updateControllerInputMap();
-  updateHotkeyInputMap();
-}
-
-void QtHostInterface::updateControllerInputMap()
-{
-  for (u32 controller_index = 0; controller_index < 2; controller_index++)
-  {
-    const ControllerType ctype = m_settings.controller_types[controller_index];
-    if (ctype == ControllerType::None)
-      continue;
-
-    const auto button_names = Controller::GetButtonNames(ctype);
-    for (const auto& [button_name, button_code] : button_names)
-    {
-      QVariant var = m_qsettings.value(
-        QStringLiteral("Controller%1/Button%2").arg(controller_index + 1).arg(QString::fromStdString(button_name)));
-      if (!var.isValid())
-        continue;
-
-      addButtonToInputMap(var.toString(), [this, controller_index, button_code](bool pressed) {
-        if (!m_system)
-          return;
-
-        Controller* controller = m_system->GetController(controller_index);
-        if (controller)
-          controller->SetButtonState(button_code, pressed);
-      });
-    }
-  }
-}
-
-std::vector<QtHostInterface::HotkeyInfo> QtHostInterface::getHotkeyList() const
-{
-  std::vector<HotkeyInfo> hotkeys = {
-    {QStringLiteral("FastForward"), QStringLiteral("Toggle Fast Forward"), QStringLiteral("General")},
-    {QStringLiteral("Fullscreen"), QStringLiteral("Toggle Fullscreen"), QStringLiteral("General")},
-    {QStringLiteral("Pause"), QStringLiteral("Toggle Pause"), QStringLiteral("General")},
-    {QStringLiteral("ToggleSoftwareRendering"), QStringLiteral("Toggle Software Rendering"),
-     QStringLiteral("Graphics")},
-    {QStringLiteral("IncreaseResolutionScale"), QStringLiteral("Increase Resolution Scale"),
-     QStringLiteral("Graphics")},
-    {QStringLiteral("DecreaseResolutionScale"), QStringLiteral("Decrease Resolution Scale"),
-     QStringLiteral("Graphics")}};
-
-  for (u32 i = 1; i <= NUM_SAVE_STATE_HOTKEYS; i++)
-  {
-    hotkeys.push_back(
-      {QStringLiteral("LoadState%1").arg(i), QStringLiteral("Load State %1").arg(i), QStringLiteral("Save States")});
-  }
-  for (u32 i = 1; i <= NUM_SAVE_STATE_HOTKEYS; i++)
-  {
-    hotkeys.push_back(
-      {QStringLiteral("SaveState%1").arg(i), QStringLiteral("Save State %1").arg(i), QStringLiteral("Save States")});
-  }
-
-  return hotkeys;
-}
-
-void QtHostInterface::updateHotkeyInputMap()
-{
-  auto hk = [this](const QString& hotkey_name, InputButtonHandler handler) {
-    QVariant var = m_qsettings.value(QStringLiteral("Hotkeys/%1").arg(hotkey_name));
-    if (!var.isValid())
-      return;
-
-    addButtonToInputMap(var.toString(), std::move(handler));
-  };
-
-  hk(QStringLiteral("FastForward"), [this](bool pressed) {
-    m_speed_limiter_temp_disabled = pressed;
-    HostInterface::UpdateSpeedLimiterState();
-  });
-
-  hk(QStringLiteral("Fullscreen"), [this](bool pressed) {
-    if (!pressed)
-      emit toggleFullscreenRequested();
-  });
-
-  hk(QStringLiteral("Pause"), [this](bool pressed) {
-    if (!pressed)
-      pauseSystem(!m_paused);
-  });
-
-  hk(QStringLiteral("ToggleSoftwareRendering"), [this](bool pressed) {
-    if (!pressed)
-      ToggleSoftwareRendering();
-  });
-
-  hk(QStringLiteral("IncreaseResolutionScale"), [this](bool pressed) {
-    if (!pressed)
-      ModifyResolutionScale(1);
-  });
-
-  hk(QStringLiteral("DecreaseResolutionScale"), [this](bool pressed) {
-    if (!pressed)
-      ModifyResolutionScale(-1);
-  });
-
-  for (u32 i = 1; i <= NUM_SAVE_STATE_HOTKEYS; i++)
-  {
-    hk(QStringLiteral("LoadState%1").arg(i), [this, i](bool pressed) {
-      if (!pressed)
-        HostInterface::LoadState(StringUtil::StdStringFromFormat("savestate_%u.bin", i).c_str());
-    });
-
-    hk(QStringLiteral("SaveState%1").arg(i), [this, i](bool pressed) {
-      if (!pressed)
-        HostInterface::SaveState(StringUtil::StdStringFromFormat("savestate_%u.bin", i).c_str());
-    });
-  }
-}
-
-void QtHostInterface::addButtonToInputMap(const QString& binding, InputButtonHandler handler)
-{
-  const QString device = binding.section('/', 0, 0);
-  const QString button = binding.section('/', 1, 1);
-  if (device == QStringLiteral("Keyboard"))
-  {
-    std::optional<int> key_id = QtUtils::ParseKeyString(button);
-    if (!key_id.has_value())
-    {
-      qWarning() << "Unknown keyboard key " << button;
-      return;
-    }
-
-    m_keyboard_input_handlers.emplace(key_id.value(), std::move(handler));
-  }
-  else
-  {
-    qWarning() << "Unknown input device: " << device;
-    return;
-  }
-}
-
-void QtHostInterface::powerOffSystem(bool save_resume_state /* = false */, bool block_until_done /* = false */)
+void QtHostInterface::powerOffSystem()
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "powerOffSystem",
-                              block_until_done ? Qt::BlockingQueuedConnection : Qt::QueuedConnection,
-                              Q_ARG(bool, save_resume_state), Q_ARG(bool, block_until_done));
+    QMetaObject::invokeMethod(this, "powerOffSystem", Qt::QueuedConnection);
     return;
   }
 
   if (!m_system)
     return;
 
-  if (save_resume_state)
-    Log_InfoPrintf("TODO: Save resume state");
+  if (m_settings.save_state_on_exit)
+    SaveResumeSaveState();
 
   DestroySystem();
-  m_audio_stream->PauseOutput(true);
-  m_display_window->destroyDeviceContext();
+}
 
-  emit runningGameChanged(QString(), QString(), QString());
-  emit emulationStopped();
+void QtHostInterface::synchronousPowerOffSystem()
+{
+  if (!isOnWorkerThread())
+    QMetaObject::invokeMethod(this, "powerOffSystem", Qt::BlockingQueuedConnection);
+  else
+    powerOffSystem();
 }
 
 void QtHostInterface::resetSystem()
@@ -490,6 +391,9 @@ void QtHostInterface::pauseSystem(bool paused)
     return;
   }
 
+  if (!m_system)
+    return;
+
   m_paused = paused;
   m_audio_stream->PauseOutput(paused);
   if (!paused)
@@ -497,59 +401,219 @@ void QtHostInterface::pauseSystem(bool paused)
   emit emulationPaused(paused);
 }
 
-void QtHostInterface::changeDisc(QString new_disc_filename) {}
-
-void QtHostInterface::doBootSystem(QString initial_filename, QString initial_save_state_filename)
+void QtHostInterface::changeDisc(const QString& new_disc_filename)
 {
-  if (!m_display_window->initializeDeviceContext(m_settings.gpu_use_debug_device))
+  if (!isOnWorkerThread())
   {
-    emit emulationStopped();
+    QMetaObject::invokeMethod(this, "changeDisc", Qt::QueuedConnection, Q_ARG(const QString&, new_disc_filename));
     return;
   }
 
-  std::string initial_filename_str = initial_filename.toStdString();
-  std::string initial_save_state_filename_str = initial_save_state_filename.toStdString();
-  std::lock_guard<std::mutex> lock(m_qsettings_mutex);
-  if (!CreateSystem() ||
-      !BootSystem(initial_filename_str.empty() ? nullptr : initial_filename_str.c_str(),
-                  initial_save_state_filename_str.empty() ? nullptr : initial_save_state_filename_str.c_str()))
-  {
-    DestroySystem();
-    m_display_window->destroyDeviceContext();
-    emit emulationStopped();
+  if (!m_system)
     return;
-  }
 
-  wakeThread();
-  m_audio_stream->PauseOutput(false);
-  UpdateSpeedLimiterState();
-  emit emulationStarted();
+  m_system->InsertMedia(new_disc_filename.toStdString().c_str());
 }
 
-void QtHostInterface::createAudioStream()
+void QtHostInterface::populateSaveStateMenus(const char* game_code, QMenu* load_menu, QMenu* save_menu)
 {
-  switch (m_settings.audio_backend)
-  {
-    case AudioBackend::Default:
-    case AudioBackend::Cubeb:
-      m_audio_stream = AudioStream::CreateCubebAudioStream();
-      break;
+  const std::vector<SaveStateInfo> available_states(GetAvailableSaveStates(game_code));
 
-    case AudioBackend::Null:
-    default:
-      m_audio_stream = AudioStream::CreateNullAudioStream();
-      break;
+  load_menu->clear();
+  if (!available_states.empty())
+  {
+    bool last_global = available_states.front().global;
+    s32 last_slot = available_states.front().slot;
+    for (const SaveStateInfo& ssi : available_states)
+    {
+      const s32 slot = ssi.slot;
+      const bool global = ssi.global;
+      const QDateTime timestamp(QDateTime::fromSecsSinceEpoch(static_cast<qint64>(ssi.timestamp)));
+      const QString timestamp_str(timestamp.toString(Qt::SystemLocaleShortDate));
+      const QString path(QString::fromStdString(ssi.path));
+
+      QString title;
+      if (slot < 0)
+        title = tr("Resume Save (%1)").arg(timestamp_str);
+      else
+        title = tr("%1 Save %2 (%3)").arg(global ? tr("Global") : tr("Game")).arg(slot).arg(timestamp_str);
+
+      if (global != last_global || last_slot < 0)
+        load_menu->addSeparator();
+
+      last_global = global;
+      last_slot = slot;
+
+      QAction* action = load_menu->addAction(title);
+      connect(action, &QAction::triggered, [this, path]() { loadState(path); });
+    }
   }
 
-  if (!m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BUFFER_SIZE, 4))
+  save_menu->clear();
+  if (game_code && std::strlen(game_code) > 0)
   {
-    qWarning() << "Failed to configure audio stream, falling back to null output";
+    for (s32 i = 1; i <= PER_GAME_SAVE_STATE_SLOTS; i++)
+    {
+      QAction* action = save_menu->addAction(tr("Game Save %1").arg(i));
+      connect(action, &QAction::triggered, [this, i]() { saveState(false, i); });
+    }
 
-    // fall back to null output
-    m_audio_stream.reset();
-    m_audio_stream = AudioStream::CreateNullAudioStream();
-    m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BUFFER_SIZE, 4);
+    save_menu->addSeparator();
   }
+
+  for (s32 i = 1; i <= GLOBAL_SAVE_STATE_SLOTS; i++)
+  {
+    QAction* action = save_menu->addAction(tr("Global Save %1").arg(i));
+    connect(action, &QAction::triggered, [this, i]() { saveState(true, i); });
+  }
+}
+
+void QtHostInterface::populateGameListContextMenu(const char* game_code, QWidget* parent_window, QMenu* menu)
+{
+  QAction* resume_action = menu->addAction(tr("Resume"));
+  resume_action->setEnabled(false);
+
+  QMenu* load_state_menu = menu->addMenu(tr("Load State"));
+  load_state_menu->setEnabled(false);
+
+  const std::vector<SaveStateInfo> available_states(GetAvailableSaveStates(game_code));
+  for (const SaveStateInfo& ssi : available_states)
+  {
+    if (ssi.global)
+      continue;
+
+    const s32 slot = ssi.slot;
+    const QDateTime timestamp(QDateTime::fromSecsSinceEpoch(static_cast<qint64>(ssi.timestamp)));
+    const QString timestamp_str(timestamp.toString(Qt::SystemLocaleShortDate));
+    const QString path(QString::fromStdString(ssi.path));
+
+    QAction* action;
+    if (slot < 0)
+    {
+      resume_action->setText(tr("Resume (%1)").arg(timestamp_str));
+      resume_action->setEnabled(true);
+      action = resume_action;
+    }
+    else
+    {
+      load_state_menu->setEnabled(true);
+      action = load_state_menu->addAction(tr("%1 Save %2 (%3)").arg(tr("Game")).arg(slot).arg(timestamp_str));
+    }
+
+    connect(action, &QAction::triggered, [this, path]() { loadState(path); });
+  }
+
+  const bool has_any_states = resume_action->isEnabled() || load_state_menu->isEnabled();
+  QAction* delete_save_states_action = menu->addAction(tr("Delete Save States..."));
+  delete_save_states_action->setEnabled(has_any_states);
+  if (has_any_states)
+  {
+    const std::string game_code_copy(game_code);
+    connect(delete_save_states_action, &QAction::triggered, [this, parent_window, game_code_copy] {
+      if (QMessageBox::warning(
+            parent_window, tr("Confirm Save State Deletion"),
+            tr("Are you sure you want to delete all save states for %1?\n\nThe saves will not be recoverable.")
+              .arg(game_code_copy.c_str()),
+            QMessageBox::Yes, QMessageBox::No) != QMessageBox::Yes)
+      {
+        return;
+      }
+
+      DeleteSaveStates(game_code_copy.c_str(), true);
+    });
+  }
+}
+
+void QtHostInterface::loadState(const QString& filename)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "loadState", Qt::QueuedConnection, Q_ARG(const QString&, filename));
+    return;
+  }
+
+  LoadState(filename.toStdString().c_str());
+}
+
+void QtHostInterface::loadState(bool global, qint32 slot)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "loadState", Qt::QueuedConnection, Q_ARG(bool, global), Q_ARG(qint32, slot));
+    return;
+  }
+
+  LoadState(global, slot);
+}
+
+void QtHostInterface::saveState(bool global, qint32 slot, bool block_until_done /* = false */)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "saveState", block_until_done ? Qt::BlockingQueuedConnection : Qt::QueuedConnection,
+                              Q_ARG(bool, global), Q_ARG(qint32, slot), Q_ARG(bool, block_until_done));
+    return;
+  }
+
+  if (m_system)
+    SaveState(global, slot);
+}
+
+void QtHostInterface::enableBackgroundControllerPolling()
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "enableBackgroundControllerPolling", Qt::BlockingQueuedConnection);
+    return;
+  }
+
+  if (m_background_controller_polling_enable_count++ > 0)
+    return;
+
+  if (!m_system || m_paused)
+  {
+    createBackgroundControllerPollTimer();
+
+    // drain the event queue so we don't get events late
+    g_sdl_controller_interface.PumpSDLEvents();
+  }
+}
+
+void QtHostInterface::disableBackgroundControllerPolling()
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "disableBackgroundControllerPolling");
+    return;
+  }
+
+  Assert(m_background_controller_polling_enable_count > 0);
+  if (--m_background_controller_polling_enable_count > 0)
+    return;
+
+  if (!m_system || m_paused)
+    destroyBackgroundControllerPollTimer();
+}
+
+void QtHostInterface::doBackgroundControllerPoll()
+{
+  g_sdl_controller_interface.PumpSDLEvents();
+}
+
+void QtHostInterface::createBackgroundControllerPollTimer()
+{
+  DebugAssert(!m_background_controller_polling_timer);
+  m_background_controller_polling_timer = new QTimer(this);
+  m_background_controller_polling_timer->setSingleShot(false);
+  m_background_controller_polling_timer->setTimerType(Qt::VeryCoarseTimer);
+  connect(m_background_controller_polling_timer, &QTimer::timeout, this, &QtHostInterface::doBackgroundControllerPoll);
+  m_background_controller_polling_timer->start(BACKGROUND_CONTROLLER_POLLING_INTERVAL);
+}
+
+void QtHostInterface::destroyBackgroundControllerPollTimer()
+{
+  delete m_background_controller_polling_timer;
+  m_background_controller_polling_timer = nullptr;
 }
 
 void QtHostInterface::createThread()
@@ -578,7 +642,10 @@ void QtHostInterface::threadEntryPoint()
 {
   m_worker_thread_event_loop = new QEventLoop();
 
-  createAudioStream();
+  // set up controller interface and immediate poll to pick up the controller attached events
+  g_sdl_controller_interface.Initialize(this);
+  g_sdl_controller_interface.PumpSDLEvents();
+  updateInputMap();
 
   // TODO: Event which flags the thread as ready
   while (!m_shutdown_flag.load())
@@ -590,36 +657,29 @@ void QtHostInterface::threadEntryPoint()
       continue;
     }
 
-    // execute the system, polling events inbetween frames
-    // simulate the system if not paused
-    RunFrame();
+    m_system->RunFrame();
 
-    // rendering
-    {
-      if (m_system)
-      {
-        DrawDebugWindows();
-        m_system->GetGPU()->ResetGraphicsAPIState();
-      }
+    m_system->GetGPU()->ResetGraphicsAPIState();
 
-      DrawOSDMessages();
+    DrawDebugWindows();
+    DrawOSDMessages();
 
-      m_display->Render();
+    m_display->Render();
 
-      if (m_system)
-      {
-        m_system->GetGPU()->RestoreGraphicsAPIState();
+    m_system->GetGPU()->RestoreGraphicsAPIState();
 
-        if (m_speed_limiter_enabled)
-          Throttle();
-      }
-    }
+    if (m_speed_limiter_enabled)
+      m_system->Throttle();
 
     m_worker_thread_event_loop->processEvents(QEventLoop::AllEvents);
+    g_sdl_controller_interface.PumpSDLEvents();
   }
 
   m_system.reset();
   m_audio_stream.reset();
+
+  g_sdl_controller_interface.Shutdown();
+
   delete m_worker_thread_event_loop;
   m_worker_thread_event_loop = nullptr;
 

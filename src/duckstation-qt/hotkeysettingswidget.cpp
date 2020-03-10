@@ -8,6 +8,7 @@
 #include <QtGui/QKeyEvent>
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QLabel>
+#include <QtWidgets/QScrollArea>
 
 HotkeySettingsWidget::HotkeySettingsWidget(QtHostInterface* host_interface, QWidget* parent /* = nullptr */)
   : QWidget(parent), m_host_interface(host_interface)
@@ -33,32 +34,35 @@ void HotkeySettingsWidget::createUi()
 
 void HotkeySettingsWidget::createButtons()
 {
-  std::vector<QtHostInterface::HotkeyInfo> hotkeys = m_host_interface->getHotkeyList();
-
-  for (const QtHostInterface::HotkeyInfo& hi : hotkeys)
+  const auto& hotkeys = m_host_interface->getHotkeyInfoList();
+  for (const auto& hi : hotkeys)
   {
-    auto iter = m_categories.find(hi.category);
+    const auto category = QString::fromUtf8(hi.category);
+
+    auto iter = m_categories.find(category);
     if (iter == m_categories.end())
     {
-      QWidget* container = new QWidget(m_tab_widget);
+      QScrollArea* scroll = new QScrollArea(m_tab_widget);
+      QWidget* container = new QWidget(scroll);
       QVBoxLayout* vlayout = new QVBoxLayout(container);
       QGridLayout* layout = new QGridLayout();
       layout->setContentsMargins(0, 0, 0, 0);
       vlayout->addLayout(layout);
       vlayout->addStretch(1);
-      iter = m_categories.insert(hi.category, Category{container, layout});
-      m_tab_widget->addTab(container, hi.category);
+      iter = m_categories.insert(category, Category{container, layout});
+      scroll->setWidget(container);
+      scroll->setWidgetResizable(true);
+      scroll->setBackgroundRole(QPalette::Base);
+      scroll->setFrameShape(QFrame::NoFrame);
+      m_tab_widget->addTab(scroll, category);
     }
 
     QWidget* container = iter->container;
     QGridLayout* layout = iter->layout;
-    const int layout_count = layout->count() / 2;
-    const int target_column = (layout_count / ROWS_PER_COLUMN) * 2;
-    const int target_row = layout_count % ROWS_PER_COLUMN;
+    const int target_row = layout->count() / 2;
 
-    const QString setting_name = QStringLiteral("Hotkeys/%1").arg(hi.name);
-    layout->addWidget(new QLabel(hi.display_name, container), target_row, target_column);
-    layout->addWidget(new InputButtonBindingWidget(m_host_interface, setting_name, container), target_row,
-                      target_column + 1);
+    const QString setting_name = QStringLiteral("Hotkeys/%1").arg(hi.name.GetCharArray());
+    layout->addWidget(new QLabel(QString::fromUtf8(hi.display_name), container), target_row, 0);
+    layout->addWidget(new InputButtonBindingWidget(m_host_interface, setting_name, container), target_row, 1);
   }
 }

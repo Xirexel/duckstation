@@ -111,7 +111,7 @@ HostDisplay* OpenGLDisplayWindow::getHostDisplayInterface()
 
 HostDisplay::RenderAPI OpenGLDisplayWindow::GetRenderAPI() const
 {
-  return HostDisplay::RenderAPI::OpenGL;
+  return m_gl_context->isOpenGLES() ? HostDisplay::RenderAPI::OpenGLES : HostDisplay::RenderAPI::OpenGL;
 }
 
 void* OpenGLDisplayWindow::GetRenderDevice() const
@@ -132,6 +132,12 @@ void* OpenGLDisplayWindow::GetRenderWindow() const
 void OpenGLDisplayWindow::ChangeRenderWindow(void* new_window)
 {
   Panic("Not implemented");
+}
+
+void OpenGLDisplayWindow::WindowResized(s32 new_window_width, s32 new_window_height)
+{
+  QtDisplayWindow::WindowResized(new_window_width, new_window_height);
+  HostDisplay::WindowResized(new_window_width, new_window_height);
 }
 
 std::unique_ptr<HostDisplayTexture> OpenGLDisplayWindow::CreateTexture(u32 width, u32 height, const void* data,
@@ -165,23 +171,29 @@ void OpenGLDisplayWindow::SetVSync(bool enabled)
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, current_fbo);
 }
 
-std::tuple<u32, u32> OpenGLDisplayWindow::GetWindowSize() const
-{
-  return std::make_tuple(static_cast<u32>(m_window_width), static_cast<u32>(m_window_height));
-}
-
-void OpenGLDisplayWindow::WindowResized() {}
-
 const char* OpenGLDisplayWindow::GetGLSLVersionString() const
 {
-  return m_is_gles ? "#version 300 es" : "#version 130\n";
+  if (m_gl_context->isOpenGLES())
+  {
+    if (GLAD_GL_ES_VERSION_3_0)
+      return "#version 300 es";
+    else
+      return "#version 100";
+  }
+  else
+  {
+    if (GLAD_GL_VERSION_3_3)
+      return "#version 330";
+    else
+      return "#version 130";
+  }
 }
 
 std::string OpenGLDisplayWindow::GetGLSLVersionHeader() const
 {
   std::string header = GetGLSLVersionString();
   header += "\n\n";
-  if (m_is_gles)
+  if (m_gl_context->isOpenGLES())
   {
     header += "precision highp float;\n";
     header += "precision highp int;\n\n";
@@ -210,6 +222,11 @@ static void APIENTRY GLDebugCallback(GLenum source, GLenum type, GLuint id, GLen
   }
 }
 
+bool OpenGLDisplayWindow::hasDeviceContext() const
+{
+  return static_cast<bool>(m_gl_context);
+}
+
 bool OpenGLDisplayWindow::createDeviceContext(QThread* worker_thread, bool debug_device)
 {
   m_gl_context = std::make_unique<QOpenGLContext>();
@@ -232,14 +249,10 @@ bool OpenGLDisplayWindow::createDeviceContext(QThread* worker_thread, bool debug
     surface_format.setVersion(major, minor);
     m_gl_context->setFormat(surface_format);
     if (m_gl_context->create())
-    {
-      m_is_gles = m_gl_context->isOpenGLES();
-      Log_InfoPrintf("Got a %s %d.%d context", m_is_gles ? "OpenGL ES" : "desktop OpenGL", major, minor);
       break;
-    }
   }
 
-  if (!m_gl_context)
+  if (!m_gl_context->isValid())
   {
     // try forcing ES
     surface_format.setRenderableType(QSurfaceFormat::OpenGLES);
@@ -252,11 +265,7 @@ bool OpenGLDisplayWindow::createDeviceContext(QThread* worker_thread, bool debug
       surface_format.setVersion(major, minor);
       m_gl_context->setFormat(surface_format);
       if (m_gl_context->create())
-      {
-        Log_InfoPrintf("Got a OpenGL ES %d.%d context", major, minor);
-        m_is_gles = true;
         break;
-      }
     }
   }
 
@@ -266,6 +275,10 @@ bool OpenGLDisplayWindow::createDeviceContext(QThread* worker_thread, bool debug
     m_gl_context.reset();
     return false;
   }
+
+  surface_format = m_gl_context->format();
+  Log_InfoPrintf("Got a %s %d.%d context", (m_gl_context->isOpenGLES() ? "OpenGL ES" : "desktop OpenGL"),
+                 surface_format.majorVersion(), surface_format.minorVersion());
 
   if (!m_gl_context->makeCurrent(this))
   {
@@ -295,7 +308,7 @@ bool OpenGLDisplayWindow::initializeDeviceContext(bool debug_device)
 
   // Load GLAD.
   const auto load_result =
-    m_is_gles ? gladLoadGLES2Loader(GetProcAddressCallback) : gladLoadGLLoader(GetProcAddressCallback);
+    m_gl_context->isOpenGLES() ? gladLoadGLES2Loader(GetProcAddressCallback) : gladLoadGLLoader(GetProcAddressCallback);
   if (!load_result)
   {
     Log_ErrorPrintf("Failed to load GL functions");
@@ -385,7 +398,7 @@ void main()
     return false;
   }
 
-  if (!m_is_gles)
+  if (!m_gl_context->isOpenGLES())
     m_display_program.BindFragData(0, "o_col0");
 
   if (!m_display_program.Link())
@@ -452,9 +465,7 @@ void OpenGLDisplayWindow::renderDisplay()
   if (!m_display_texture_handle)
     return;
 
-  // - 20 for main menu padding
-  const auto [vp_left, vp_top, vp_width, vp_height] =
-    CalculateDrawRect(m_window_width, std::max(m_window_height - m_display_top_margin, 1), m_display_aspect_ratio);
+  const auto [vp_left, vp_top, vp_width, vp_height] = CalculateDrawRect();
 
   glViewport(vp_left, m_window_height - (m_display_top_margin + vp_top) - vp_height, vp_width, vp_height);
   glDisable(GL_BLEND);
@@ -463,10 +474,11 @@ void OpenGLDisplayWindow::renderDisplay()
   glDisable(GL_SCISSOR_TEST);
   glDepthMask(GL_FALSE);
   m_display_program.Bind();
-  m_display_program.Uniform4f(0, static_cast<float>(m_display_offset_x) / static_cast<float>(m_display_texture_width),
-                              static_cast<float>(m_display_offset_y) / static_cast<float>(m_display_texture_height),
-                              static_cast<float>(m_display_width) / static_cast<float>(m_display_texture_width),
-                              static_cast<float>(m_display_height) / static_cast<float>(m_display_texture_height));
+  m_display_program.Uniform4f(
+    0, (static_cast<float>(m_display_texture_view_x) + 0.25f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_y) - 0.25f) / static_cast<float>(m_display_texture_height),
+    (static_cast<float>(m_display_texture_view_width) - 0.5f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_height) + 0.5f) / static_cast<float>(m_display_texture_height));
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(reinterpret_cast<uintptr_t>(m_display_texture_handle)));
   glBindSampler(0, m_display_linear_filtering ? m_display_linear_sampler : m_display_nearest_sampler);
   glBindVertexArray(m_display_vao);

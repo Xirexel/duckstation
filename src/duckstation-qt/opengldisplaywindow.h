@@ -1,5 +1,12 @@
 #pragma once
+
+// GLAD has to come first so that Qt doesn't pull in the system GL headers, which are incompatible with glad.
 #include <glad.h>
+
+// Hack to prevent Apple's glext.h headers from getting included via qopengl.h, since we still want to use glad.
+#ifdef __APPLE__
+#define __glext_h_
+#endif
 
 #include "common/gl/program.h"
 #include "common/gl/texture.h"
@@ -20,6 +27,7 @@ public:
 
   HostDisplay* getHostDisplayInterface() override;
 
+  bool hasDeviceContext() const override;
   bool createDeviceContext(QThread* worker_thread, bool debug_device) override;
   bool initializeDeviceContext(bool debug_device) override;
   void destroyDeviceContext() override;
@@ -30,6 +38,7 @@ public:
   void* GetRenderWindow() const override;
 
   void ChangeRenderWindow(void* new_window) override;
+  void WindowResized(s32 new_window_width, s32 new_window_height) override;
 
   std::unique_ptr<HostDisplayTexture> CreateTexture(u32 width, u32 height, const void* data, u32 data_stride,
                                                     bool dynamic) override;
@@ -37,9 +46,6 @@ public:
                      u32 data_stride) override;
 
   void SetVSync(bool enabled) override;
-
-  std::tuple<u32, u32> GetWindowSize() const override;
-  void WindowResized() override;
 
   void Render() override;
 
@@ -60,6 +66,4 @@ private:
   GLuint m_display_vao = 0;
   GLuint m_display_nearest_sampler = 0;
   GLuint m_display_linear_sampler = 0;
-
-  bool m_is_gles = false;
 };

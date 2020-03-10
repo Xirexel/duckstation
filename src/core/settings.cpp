@@ -9,29 +9,39 @@ void Settings::Load(SettingsInterface& si)
   region =
     ParseConsoleRegionName(si.GetStringValue("Console", "Region", "NTSC-U").c_str()).value_or(ConsoleRegion::NTSC_U);
 
-  speed_limiter_enabled = si.GetBoolValue("General", "SpeedLimiterEnabled", true);
-  start_paused = si.GetBoolValue("General", "StartPaused", false);
+  emulation_speed = si.GetFloatValue("Main", "EmulationSpeed", 1.0f);
+  speed_limiter_enabled = si.GetBoolValue("Main", "SpeedLimiterEnabled", true);
+  increase_timer_resolution = si.GetBoolValue("Main", "IncreaseTimerResolution", true);
+  start_paused = si.GetBoolValue("Mainal", "StartPaused", false);
+  save_state_on_exit = si.GetBoolValue("Main", "SaveStateOnExit", true);
+  confim_power_off = si.GetBoolValue("Main", "ConfirmPowerOff", true);
 
   cpu_execution_mode = ParseCPUExecutionMode(si.GetStringValue("CPU", "ExecutionMode", "Interpreter").c_str())
                          .value_or(CPUExecutionMode::Interpreter);
 
-  gpu_renderer =
-    ParseRendererName(si.GetStringValue("GPU", "Renderer", "OpenGL").c_str()).value_or(GPURenderer::HardwareOpenGL);
+  gpu_renderer = ParseRendererName(si.GetStringValue("GPU", "Renderer", GetRendererName(DEFAULT_GPU_RENDERER)).c_str())
+                   .value_or(DEFAULT_GPU_RENDERER);
   gpu_resolution_scale = static_cast<u32>(si.GetIntValue("GPU", "ResolutionScale", 1));
-  gpu_true_color = si.GetBoolValue("GPU", "TrueColor", false);
+  gpu_true_color = si.GetBoolValue("GPU", "TrueColor", true);
+  gpu_scaled_dithering = si.GetBoolValue("GPU", "ScaledDithering", false);
   gpu_texture_filtering = si.GetBoolValue("GPU", "TextureFiltering", false);
-  gpu_force_progressive_scan = si.GetBoolValue("GPU", "ForceProgressiveScan", true);
   gpu_use_debug_device = si.GetBoolValue("GPU", "UseDebugDevice", false);
 
+  display_crop_mode = ParseDisplayCropMode(
+                        si.GetStringValue("Display", "CropMode", GetDisplayCropModeName(DisplayCropMode::None)).c_str())
+                        .value_or(DisplayCropMode::None);
+  display_force_progressive_scan = si.GetBoolValue("Display", "ForceProgressiveScan", true);
   display_linear_filtering = si.GetBoolValue("Display", "LinearFiltering", true);
   display_fullscreen = si.GetBoolValue("Display", "Fullscreen", false);
   video_sync_enabled = si.GetBoolValue("Display", "VSync", true);
 
+  cdrom_read_thread = si.GetBoolValue("CDROM", "ReadThread", true);
+
   audio_backend =
-    ParseAudioBackend(si.GetStringValue("Audio", "Backend", "Default").c_str()).value_or(AudioBackend::Default);
+    ParseAudioBackend(si.GetStringValue("Audio", "Backend", "Cubeb").c_str()).value_or(AudioBackend::Cubeb);
   audio_sync_enabled = si.GetBoolValue("Audio", "Sync", true);
 
-  bios_path = si.GetStringValue("BIOS", "Path", "scph1001.bin");
+  bios_path = si.GetStringValue("BIOS", "Path", "bios/scph1001.bin");
   bios_patch_tty_enable = si.GetBoolValue("BIOS", "PatchTTYEnable", true);
   bios_patch_fast_boot = si.GetBoolValue("BIOS", "PatchFastBoot", false);
 
@@ -40,7 +50,7 @@ void Settings::Load(SettingsInterface& si)
   controller_types[1] =
     ParseControllerTypeName(si.GetStringValue("Controller2", "Type", "None").c_str()).value_or(ControllerType::None);
 
-  memory_card_paths[0] = si.GetStringValue("MemoryCards", "Card1Path", "memory_card_1.mcd");
+  memory_card_paths[0] = si.GetStringValue("MemoryCards", "Card1Path", "memcards/shared_card_1.mcd");
   memory_card_paths[1] = si.GetStringValue("MemoryCards", "Card2Path", "");
 
   debugging.show_vram = si.GetBoolValue("Debug", "ShowVRAM");
@@ -57,21 +67,28 @@ void Settings::Save(SettingsInterface& si) const
 {
   si.SetStringValue("Console", "Region", GetConsoleRegionName(region));
 
-  si.SetBoolValue("General", "SpeedLimiterEnabled", speed_limiter_enabled);
-  si.SetBoolValue("General", "StartPaused", start_paused);
+  si.SetFloatValue("Main", "EmulationSpeed", emulation_speed);
+  si.SetBoolValue("Main", "SpeedLimiterEnabled", speed_limiter_enabled);
+  si.SetBoolValue("Main", "IncreaseTimerResolution", increase_timer_resolution);
+  si.SetBoolValue("Main", "StartPaused", start_paused);
+  si.SetBoolValue("Main", "SaveStateOnExit", save_state_on_exit);
+  si.SetBoolValue("Main", "ConfirmPowerOff", confim_power_off);
 
   si.SetStringValue("CPU", "ExecutionMode", GetCPUExecutionModeName(cpu_execution_mode));
 
   si.SetStringValue("GPU", "Renderer", GetRendererName(gpu_renderer));
   si.SetIntValue("GPU", "ResolutionScale", static_cast<long>(gpu_resolution_scale));
   si.SetBoolValue("GPU", "TrueColor", gpu_true_color);
+  si.SetBoolValue("GPU", "ScaledDithering", gpu_scaled_dithering);
   si.SetBoolValue("GPU", "TextureFiltering", gpu_texture_filtering);
-  si.SetBoolValue("GPU", "ForceProgressiveScan", gpu_force_progressive_scan);
   si.SetBoolValue("GPU", "UseDebugDevice", gpu_use_debug_device);
 
+  si.SetBoolValue("Display", "ForceProgressiveScan", display_force_progressive_scan);
   si.SetBoolValue("Display", "LinearFiltering", display_linear_filtering);
   si.SetBoolValue("Display", "Fullscreen", display_fullscreen);
   si.SetBoolValue("Display", "VSync", video_sync_enabled);
+
+  si.SetBoolValue("CDROM", "ReadThread", cdrom_read_thread);
 
   si.SetStringValue("Audio", "Backend", GetAudioBackendName(audio_backend));
   si.SetBoolValue("Audio", "Sync", audio_sync_enabled);
@@ -201,8 +218,35 @@ const char* Settings::GetRendererDisplayName(GPURenderer renderer)
   return s_gpu_renderer_display_names[static_cast<int>(renderer)];
 }
 
-static std::array<const char*, 3> s_audio_backend_names = {{"Null", "Default", "Cubeb"}};
-static std::array<const char*, 3> s_audio_backend_display_names = {{"Null (No Output)", "Default", "Cubeb"}};
+static std::array<const char*, 3> s_display_crop_mode_names = {{"None", "Overscan", "Borders"}};
+static std::array<const char*, 3> s_display_crop_mode_display_names = {{"None", "Only Overscan Area", "All Borders"}};
+
+std::optional<DisplayCropMode> Settings::ParseDisplayCropMode(const char* str)
+{
+  int index = 0;
+  for (const char* name : s_display_crop_mode_names)
+  {
+    if (StringUtil::Strcasecmp(name, str) == 0)
+      return static_cast<DisplayCropMode>(index);
+
+    index++;
+  }
+
+  return std::nullopt;
+}
+
+const char* Settings::GetDisplayCropModeName(DisplayCropMode crop_mode)
+{
+  return s_display_crop_mode_names[static_cast<int>(crop_mode)];
+}
+
+const char* Settings::GetDisplayCropModeDisplayName(DisplayCropMode crop_mode)
+{
+  return s_display_crop_mode_display_names[static_cast<int>(crop_mode)];
+}
+
+static std::array<const char*, 3> s_audio_backend_names = {{"Null", "Cubeb", "SDL"}};
+static std::array<const char*, 3> s_audio_backend_display_names = {{"Null (No Output)", "Cubeb", "SDL"}};
 
 std::optional<AudioBackend> Settings::ParseAudioBackend(const char* str)
 {

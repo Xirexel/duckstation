@@ -8,6 +8,8 @@ add_library(core
     bus.inl
     cdrom.cpp
     cdrom.h
+    cdrom_async_reader.cpp
+    cdrom_async_reader.h
     controller.cpp
     controller.h
     cpu_code_cache.cpp
@@ -91,6 +93,7 @@ if(WIN32)
     gpu_hw_d3d11.cpp
     gpu_hw_d3d11.h
   )
+  target_link_libraries(core PRIVATE winmm.lib)
 endif()
 
 if(${CPU_ARCH} STREQUAL "x64")

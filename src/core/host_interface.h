@@ -12,11 +12,13 @@
 #include <vector>
 
 class AudioStream;
+class ByteStream;
 class CDImage;
 class HostDisplay;
 class GameList;
 
 class System;
+struct SystemBootParameters;
 
 class HostInterface
 {
@@ -27,59 +29,80 @@ public:
   virtual ~HostInterface();
 
   /// Access to host display.
-  ALWAYS_INLINE HostDisplay* GetDisplay() const { return m_display.get(); }
+  ALWAYS_INLINE HostDisplay* GetDisplay() const { return m_display; }
 
   /// Access to host audio stream.
-  AudioStream* GetAudioStream() const { return m_audio_stream.get(); }
+  ALWAYS_INLINE AudioStream* GetAudioStream() const { return m_audio_stream.get(); }
 
   /// Returns a settings object which can be modified.
-  Settings& GetSettings() { return m_settings; }
+  ALWAYS_INLINE Settings& GetSettings() { return m_settings; }
 
   /// Returns the game list.
-  const GameList* GetGameList() const { return m_game_list.get(); }
+  ALWAYS_INLINE const GameList* GetGameList() const { return m_game_list.get(); }
 
-  /// Adjusts the throttle frequency, i.e. how many times we should sleep per second.
-  void SetThrottleFrequency(double frequency) { m_throttle_period = static_cast<s64>(1000000000.0 / frequency); }
+  /// Access to emulated system.
+  ALWAYS_INLINE System* GetSystem() const { return m_system.get(); }
 
-  bool CreateSystem();
-  bool BootSystem(const char* filename, const char* state_filename);
+  bool BootSystem(const SystemBootParameters& parameters);
+  void PauseSystem(bool paused);
   void ResetSystem();
+  void PowerOffSystem();
   void DestroySystem();
+
+  /// Loads state from the specified filename.
+  bool LoadState(const char* filename);
+
+  /// Loads the current emulation state from file. Specifying a slot of -1 loads the "resume" game state.
+  bool LoadState(bool global, s32 slot);
+
+  /// Saves the current emulation state to a file. Specifying a slot of -1 saves the "resume" save state.
+  bool SaveState(bool global, s32 slot);
+
+  /// Loads the resume save state for the given game. Optionally boots the game anyway if loading fails.
+  bool ResumeSystemFromState(const char* filename, bool boot_on_failure);
+
+  /// Loads the most recent resume save state. This may be global or per-game.
+  bool ResumeSystemFromMostRecentState();
+
+  /// Saves the resume save state, call when shutting down. Not called automatically on DestroySystem() since that can
+  /// be called as a result of an error.
+  bool SaveResumeSaveState();
 
   virtual void ReportError(const char* message);
   virtual void ReportMessage(const char* message);
+  virtual bool ConfirmMessage(const char* message);
 
   void ReportFormattedError(const char* format, ...);
   void ReportFormattedMessage(const char* format, ...);
+  bool ConfirmFormattedMessage(const char* format, ...);
 
   /// Adds OSD messages, duration is in seconds.
   void AddOSDMessage(const char* message, float duration = 2.0f);
   void AddFormattedOSDMessage(float duration, const char* format, ...);
 
-  /// Loads the BIOS image for the specified region.
-  virtual std::optional<std::vector<u8>> GetBIOSImage(ConsoleRegion region);
-
-  bool LoadState(const char* filename);
-  bool SaveState(const char* filename);
-
   /// Returns the base user directory path.
-  const std::string& GetUserDirectory() const { return m_user_directory; }
+  ALWAYS_INLINE const std::string& GetUserDirectory() const { return m_user_directory; }
 
   /// Returns a path relative to the user directory.
   std::string GetUserDirectoryRelativePath(const char* format, ...) const;
 
-  /// Throttles the system, i.e. sleeps until it's time to execute the next frame.
-  void Throttle();
+  /// Displays a loading screen with the logo, rendered with ImGui. Use when executing possibly-time-consuming tasks
+  /// such as compiling shaders when starting up.
+  void DisplayLoadingScreen(const char* message, int progress_min = -1, int progress_max = -1, int progress_value = -1);
+
+  /// Deletes save states for the specified game code. If resume is set, the resume state is deleted too.
+  void DeleteSaveStates(const char* game_code, bool resume);
 
 protected:
-  using ThrottleClock = std::chrono::steady_clock;
-
   enum : u32
   {
+    SETTINGS_VERSION = 2,
     AUDIO_SAMPLE_RATE = 44100,
     AUDIO_CHANNELS = 2,
     AUDIO_BUFFER_SIZE = 2048,
-    AUDIO_BUFFERS = 2
+    AUDIO_BUFFERS = 2,
+    PER_GAME_SAVE_STATE_SLOTS = 10,
+    GLOBAL_SAVE_STATE_SLOTS = 10,
   };
 
   struct OSDMessage
@@ -89,9 +112,25 @@ protected:
     float duration;
   };
 
-  virtual void SwitchGPURenderer();
-  virtual void OnPerformanceCountersUpdated();
+  struct SaveStateInfo
+  {
+    std::string path;
+    u64 timestamp;
+    s32 slot;
+    bool global;
+  };
+
+  virtual bool AcquireHostDisplay() = 0;
+  virtual void ReleaseHostDisplay() = 0;
+  virtual std::unique_ptr<AudioStream> CreateAudioStream(AudioBackend backend) = 0;
+
+  virtual void OnSystemCreated();
+  virtual void OnSystemPaused(bool paused);
+  virtual void OnSystemDestroyed();
+  virtual void OnSystemPerformanceCountersUpdated();
+  virtual void OnSystemStateSaved(bool global, s32 slot);
   virtual void OnRunningGameChanged();
+  virtual void OnControllerTypeChanged(u32 slot);
 
   void SetUserDirectory();
 
@@ -108,19 +147,31 @@ protected:
   std::string GetGameListDatabaseFileName() const;
 
   /// Returns the path to a save state file. Specifying an index of -1 is the "resume" save state.
-  std::string GetGameSaveStateFileName(const char* game_code, s32 slot);
+  std::string GetGameSaveStateFileName(const char* game_code, s32 slot) const;
 
   /// Returns the path to a save state file. Specifying an index of -1 is the "resume" save state.
-  std::string GetGlobalSaveStateFileName(s32 slot);
+  std::string GetGlobalSaveStateFileName(s32 slot) const;
 
   /// Returns the default path to a memory card.
-  std::string GetSharedMemoryCardPath(u32 slot);
+  std::string GetSharedMemoryCardPath(u32 slot) const;
 
   /// Returns the default path to a memory card for a specific game.
-  std::string GetGameMemoryCardPath(const char* game_code, u32 slot);
+  std::string GetGameMemoryCardPath(const char* game_code, u32 slot) const;
+
+  /// Returns a list of save states for the specified game code.
+  std::vector<SaveStateInfo> GetAvailableSaveStates(const char* game_code) const;
+
+  /// Returns the most recent resume save state.
+  std::string GetMostRecentResumeSaveStatePath() const;
+
+  /// Loads the BIOS image for the specified region.
+  std::optional<std::vector<u8>> GetBIOSImage(ConsoleRegion region);
+
+  /// Ensures the settings is valid and the correct version. If not, resets to defaults.
+  void CheckSettings(SettingsInterface& si);
 
   /// Restores all settings to defaults.
-  void SetDefaultSettings();
+  virtual void SetDefaultSettings(SettingsInterface& si);
 
   /// Applies new settings, updating internal state as needed. apply_callback should call m_settings.Load() after
   /// locking any required mutexes.
@@ -132,48 +183,34 @@ protected:
   /// Adjusts the internal (render) resolution of the hardware backends.
   void ModifyResolutionScale(s32 increment);
 
-  void RunFrame();
+  /// Switches the GPU renderer by saving state, recreating the display window, and restoring state (if needed).
+  void RecreateSystem();
+
+  /// Increases timer resolution when supported by the host OS.
+  void SetTimerResolutionIncreased(bool enabled);
 
   void UpdateSpeedLimiterState();
 
   void DrawFPSWindow();
   void DrawOSDMessages();
   void DrawDebugWindows();
-  void ClearImGuiFocus();
 
-  void UpdatePerformanceCounters();
-  void ResetPerformanceCounters();
-
-  std::unique_ptr<HostDisplay> m_display;
+  HostDisplay* m_display = nullptr;
   std::unique_ptr<AudioStream> m_audio_stream;
   std::unique_ptr<System> m_system;
   std::unique_ptr<GameList> m_game_list;
   Settings m_settings;
   std::string m_user_directory;
 
-  u64 m_last_throttle_time = 0;
-  s64 m_throttle_period = INT64_C(1000000000) / 60;
-  Common::Timer m_throttle_timer;
-  Common::Timer m_speed_lost_time_timestamp;
-
   bool m_paused = false;
   bool m_speed_limiter_temp_disabled = false;
   bool m_speed_limiter_enabled = false;
-
-  float m_average_frame_time_accumulator = 0.0f;
-  float m_worst_frame_time_accumulator = 0.0f;
-
-  float m_vps = 0.0f;
-  float m_fps = 0.0f;
-  float m_speed = 0.0f;
-  float m_worst_frame_time = 0.0f;
-  float m_average_frame_time = 0.0f;
-  u32 m_last_frame_number = 0;
-  u32 m_last_internal_frame_number = 0;
-  u32 m_last_global_tick_counter = 0;
-  Common::Timer m_fps_timer;
-  Common::Timer m_frame_timer;
+  bool m_timer_resolution_increased = false;
 
   std::deque<OSDMessage> m_osd_messages;
   std::mutex m_osd_messages_lock;
+
+private:
+  void CreateAudioStream();
+  bool SaveState(const char* filename);
 };

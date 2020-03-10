@@ -2,6 +2,8 @@
 #include "common/assert.h"
 #include "common/d3d11/shader_compiler.h"
 #include "common/log.h"
+#include "frontend-common/display_ps.hlsl.h"
+#include "frontend-common/display_vs.hlsl.h"
 #include <array>
 #include <dxgi1_5.h>
 #include <imgui.h>
@@ -96,6 +98,25 @@ void D3D11DisplayWindow::ChangeRenderWindow(void* new_window)
   Panic("Not supported");
 }
 
+void D3D11DisplayWindow::WindowResized(s32 new_window_width, s32 new_window_height)
+{
+  QtDisplayWindow::WindowResized(new_window_width, new_window_height);
+  HostDisplay::WindowResized(new_window_width, new_window_height);
+
+  if (!m_swap_chain)
+    return;
+
+  m_swap_chain_rtv.Reset();
+
+  HRESULT hr = m_swap_chain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN,
+                                           m_allow_tearing_supported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+  if (FAILED(hr))
+    Log_ErrorPrintf("ResizeBuffers() failed: 0x%08X", hr);
+
+  if (!createSwapChainRTV())
+    Panic("Failed to recreate swap chain RTV after resize");
+}
+
 std::unique_ptr<HostDisplayTexture> D3D11DisplayWindow::CreateTexture(u32 width, u32 height, const void* data,
                                                                       u32 data_stride, bool dynamic)
 {
@@ -143,30 +164,9 @@ void D3D11DisplayWindow::SetVSync(bool enabled)
   m_vsync = enabled;
 }
 
-std::tuple<u32, u32> D3D11DisplayWindow::GetWindowSize() const
+bool D3D11DisplayWindow::hasDeviceContext() const
 {
-  const QSize s = size();
-  return std::make_tuple(static_cast<u32>(s.width()), static_cast<u32>(s.height()));
-}
-
-void D3D11DisplayWindow::WindowResized() {}
-
-void D3D11DisplayWindow::onWindowResized(int width, int height)
-{
-  QtDisplayWindow::onWindowResized(width, height);
-
-  if (!m_swap_chain)
-    return;
-
-  m_swap_chain_rtv.Reset();
-
-  HRESULT hr = m_swap_chain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN,
-                                           m_allow_tearing_supported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
-  if (FAILED(hr))
-    Log_ErrorPrintf("ResizeBuffers() failed: 0x%08X", hr);
-
-  if (!createSwapChainRTV())
-    Panic("Failed to recreate swap chain RTV after resize");
+  return static_cast<bool>(m_device);
 }
 
 bool D3D11DisplayWindow::createDeviceContext(QThread* worker_thread, bool debug_device)
@@ -233,6 +233,10 @@ bool D3D11DisplayWindow::createDeviceContext(QThread* worker_thread, bool debug_
       return false;
     }
   }
+
+  hr = dxgi_factory->MakeWindowAssociation(swap_chain_desc.OutputWindow, DXGI_MWA_NO_WINDOW_CHANGES);
+  if (FAILED(hr))
+    Log_WarningPrintf("MakeWindowAssociation() to disable ALT+ENTER failed");
 
   if (debug_device)
   {
@@ -301,39 +305,12 @@ bool D3D11DisplayWindow::createSwapChainRTV()
 
 bool D3D11DisplayWindow::createDeviceResources()
 {
-  static constexpr char fullscreen_quad_vertex_shader[] = R"(
-cbuffer UBOBlock : register(b0)
-{
-  float4 u_src_rect;
-};
-
-void main(in uint vertex_id : SV_VertexID,
-          out float2 v_tex0 : TEXCOORD0,
-          out float4 o_pos : SV_Position)
-{
-  float2 pos = float2(float((vertex_id << 1) & 2u), float(vertex_id & 2u));
-  v_tex0 = u_src_rect.xy + pos * u_src_rect.zw;
-  o_pos = float4(pos * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
-}
-)";
-
-  static constexpr char display_pixel_shader[] = R"(
-Texture2D samp0 : register(t0);
-SamplerState samp0_ss : register(s0);
-
-void main(in float2 v_tex0 : TEXCOORD0,
-          out float4 o_col0 : SV_Target)
-{
-  o_col0 = samp0.Sample(samp0_ss, v_tex0);
-}
-)";
-
   HRESULT hr;
 
   m_display_vertex_shader =
-    D3D11::ShaderCompiler::CompileAndCreateVertexShader(m_device.Get(), fullscreen_quad_vertex_shader, false);
+    D3D11::ShaderCompiler::CreateVertexShader(m_device.Get(), s_display_vs_bytecode, sizeof(s_display_vs_bytecode));
   m_display_pixel_shader =
-    D3D11::ShaderCompiler::CompileAndCreatePixelShader(m_device.Get(), display_pixel_shader, false);
+    D3D11::ShaderCompiler::CreatePixelShader(m_device.Get(), s_display_ps_bytecode, sizeof(s_display_ps_bytecode));
   if (!m_display_vertex_shader || !m_display_pixel_shader)
     return false;
 
@@ -431,10 +408,7 @@ void D3D11DisplayWindow::renderDisplay()
   if (!m_display_texture_handle)
     return;
 
-  // - 20 for main menu padding
-  auto [vp_left, vp_top, vp_width, vp_height] =
-    CalculateDrawRect(m_window_width, std::max(m_window_height - m_display_top_margin, 1), m_display_aspect_ratio);
-  vp_top += m_display_top_margin;
+  auto [vp_left, vp_top, vp_width, vp_height] = CalculateDrawRect();
 
   m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   m_context->VSSetShader(m_display_vertex_shader.Get(), nullptr, 0);
@@ -443,10 +417,11 @@ void D3D11DisplayWindow::renderDisplay()
   m_context->PSSetSamplers(
     0, 1, m_display_linear_filtering ? m_linear_sampler.GetAddressOf() : m_point_sampler.GetAddressOf());
 
-  const float uniforms[4] = {static_cast<float>(m_display_offset_x) / static_cast<float>(m_display_texture_width),
-                             static_cast<float>(m_display_offset_y) / static_cast<float>(m_display_texture_height),
-                             static_cast<float>(m_display_width) / static_cast<float>(m_display_texture_width),
-                             static_cast<float>(m_display_height) / static_cast<float>(m_display_texture_height)};
+  const float uniforms[4] = {
+    (static_cast<float>(m_display_texture_view_x) + 0.25f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_y) + 0.25f) / static_cast<float>(m_display_texture_height),
+    (static_cast<float>(m_display_texture_view_width) - 0.5f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_height) - 0.5f) / static_cast<float>(m_display_texture_height)};
   const auto map = m_display_uniform_buffer.Map(m_context.Get(), sizeof(uniforms), sizeof(uniforms));
   std::memcpy(map.pointer, uniforms, sizeof(uniforms));
   m_display_uniform_buffer.Unmap(m_context.Get(), sizeof(uniforms));

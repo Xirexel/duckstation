@@ -1,4 +1,5 @@
 #pragma once
+#include "common/timer.h"
 #include "host_interface.h"
 #include "timing_event.h"
 #include "types.h"
@@ -27,11 +28,21 @@ class SPU;
 class MDEC;
 class SIO;
 
+struct SystemBootParameters
+{
+  SystemBootParameters();
+  SystemBootParameters(std::string filename_);
+  ~SystemBootParameters();
+
+  std::string filename;
+  std::optional<bool> override_fast_boot;
+};
+
 class System
 {
+public:
   friend TimingEvent;
 
-public:
   ~System();
 
   /// Creates a new System.
@@ -68,7 +79,13 @@ public:
   const std::string& GetRunningCode() const { return m_running_game_code; }
   const std::string& GetRunningTitle() const { return m_running_game_title; }
 
-  bool Boot(const char* filename);
+  float GetFPS() const { return m_fps; }
+  float GetVPS() const { return m_vps; }
+  float GetEmulationSpeed() const { return m_speed; }
+  float GetAverageFrameTime() const { return m_average_frame_time; }
+  float GetWorstFrameTime() const { return m_worst_frame_time; }
+
+  bool Boot(const SystemBootParameters& params);
   void Reset();
 
   bool LoadState(ByteStream* state);
@@ -84,6 +101,18 @@ public:
   void SetCPUExecutionMode(CPUExecutionMode mode);
 
   void RunFrame();
+
+  /// Adjusts the throttle frequency, i.e. how many times we should sleep per second.
+  void SetThrottleFrequency(float frequency);
+
+  /// Updates the throttle period, call when target emulation speed changes.
+  void UpdateThrottlePeriod();
+
+  /// Throttles the system, i.e. sleeps until it's time to execute the next frame.
+  void Throttle();
+
+  void UpdatePerformanceCounters();
+  void ResetPerformanceCounters();
 
   bool LoadEXE(const char* filename, std::vector<u8>& bios_image);
   bool SetExpansionROM(const char* filename);
@@ -103,8 +132,6 @@ public:
   /// Creates a new event.
   std::unique_ptr<TimingEvent> CreateTimingEvent(std::string name, TickCount period, TickCount interval,
                                                  TimingEventCallback callback, bool activate);
-
-  bool RUNNING_EVENTS() const { return m_running_events; }
 
 private:
   System(HostInterface* host_interface);
@@ -171,4 +198,24 @@ private:
   std::string m_running_game_path;
   std::string m_running_game_code;
   std::string m_running_game_title;
+
+  float m_throttle_frequency = 60.0f;
+  s32 m_throttle_period = 0;
+  u64 m_last_throttle_time = 0;
+  Common::Timer m_throttle_timer;
+  Common::Timer m_speed_lost_time_timestamp;
+
+  float m_average_frame_time_accumulator = 0.0f;
+  float m_worst_frame_time_accumulator = 0.0f;
+
+  float m_vps = 0.0f;
+  float m_fps = 0.0f;
+  float m_speed = 0.0f;
+  float m_worst_frame_time = 0.0f;
+  float m_average_frame_time = 0.0f;
+  u32 m_last_frame_number = 0;
+  u32 m_last_internal_frame_number = 0;
+  u32 m_last_global_tick_counter = 0;
+  Common::Timer m_fps_timer;
+  Common::Timer m_frame_timer;
 };

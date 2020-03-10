@@ -12,7 +12,8 @@ GPU_SW::GPU_SW()
 
 GPU_SW::~GPU_SW()
 {
-  m_host_display->SetDisplayTexture(nullptr, 0, 0, 0, 0, 0, 0, 1.0f);
+  if (m_host_display)
+    m_host_display->ClearDisplayTexture();
 }
 
 bool GPU_SW::IsHardwareRenderer() const
@@ -38,39 +39,6 @@ void GPU_SW::Reset()
   GPU::Reset();
 
   m_vram.fill(0);
-}
-
-void GPU_SW::ReadVRAM(u32 x, u32 y, u32 width, u32 height)
-{
-  // No need to do anything - pointer is already up to date.
-}
-
-void GPU_SW::FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color)
-{
-  const u16 color16 = RGBA8888ToRGBA5551(color);
-  for (u32 yoffs = 0; yoffs < height; yoffs++)
-    std::fill_n(GetPixelPtr(x, y + yoffs), width, color16);
-}
-
-void GPU_SW::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height)
-{
-  // This doesn't have a fast path, but do we really need one? It's not common.
-  const u16 mask_and = m_GPUSTAT.GetMaskAND();
-  const u16 mask_or = m_GPUSTAT.GetMaskOR();
-
-  for (u32 row = 0; row < height; row++)
-  {
-    const u16* src_row_ptr = &m_vram_ptr[((src_y + row) % VRAM_HEIGHT) * VRAM_WIDTH];
-    u16* dst_row_ptr = &m_vram_ptr[((dst_y + row) % VRAM_HEIGHT) * VRAM_WIDTH];
-
-    for (u32 col = 0; col < width; col++)
-    {
-      const u16 src_pixel = src_row_ptr[(src_x + col) % VRAM_WIDTH];
-      u16* dst_pixel_ptr = &dst_row_ptr[(dst_x + col) % VRAM_WIDTH];
-      if ((*dst_pixel_ptr & mask_and) == mask_and)
-        *dst_pixel_ptr = src_pixel | mask_or;
-    }
-  }
 }
 
 void GPU_SW::CopyOut15Bit(const u16* src_ptr, u32 src_stride, u32* dst_ptr, u32 dst_stride, u32 width, u32 height)
@@ -113,21 +81,18 @@ void GPU_SW::UpdateDisplay()
   // fill display texture
   m_display_texture_buffer.resize(VRAM_WIDTH * VRAM_HEIGHT);
 
-  u32 display_width;
-  u32 display_height;
-  float display_aspect_ratio;
   if (!m_system->GetSettings().debugging.show_vram)
   {
     // TODO: Handle interlacing
     const u32 vram_offset_x = m_crtc_state.regs.X;
     const u32 vram_offset_y = m_crtc_state.regs.Y;
-    display_width = std::min<u32>(m_crtc_state.display_width, VRAM_WIDTH - vram_offset_x);
-    display_height = std::min<u32>(m_crtc_state.display_height, VRAM_HEIGHT - vram_offset_y);
-    display_aspect_ratio = m_crtc_state.display_aspect_ratio;
+    const u32 display_width = std::min<u32>(m_crtc_state.active_display_width, VRAM_WIDTH - vram_offset_x);
+    const u32 display_height = std::min<u32>(m_crtc_state.active_display_height << BoolToUInt8(m_GPUSTAT.In480iMode()),
+                                             VRAM_HEIGHT - vram_offset_y);
 
     if (m_GPUSTAT.display_disable)
     {
-      m_host_display->SetDisplayTexture(nullptr, 0, 0, 0, 0, 0, 0, display_aspect_ratio);
+      m_host_display->ClearDisplayTexture();
       return;
     }
     else if (m_GPUSTAT.display_area_color_depth_24)
@@ -140,20 +105,24 @@ void GPU_SW::UpdateDisplay()
       CopyOut15Bit(m_vram.data() + vram_offset_y * VRAM_WIDTH + vram_offset_x, VRAM_WIDTH,
                    m_display_texture_buffer.data(), display_width, display_width, display_height);
     }
+
+    m_host_display->UpdateTexture(m_display_texture.get(), 0, 0, display_width, display_height,
+                                  m_display_texture_buffer.data(), display_width * sizeof(u32));
+    m_host_display->SetDisplayTexture(m_display_texture->GetHandle(), VRAM_WIDTH, VRAM_HEIGHT, 0, 0, display_width,
+                                      display_height);
+    m_host_display->SetDisplayParameters(m_crtc_state.visible_display_width, m_crtc_state.visible_display_height,
+                                         m_crtc_state.GetActiveDisplayRectangle(), m_crtc_state.display_aspect_ratio);
   }
   else
   {
-    display_width = VRAM_WIDTH;
-    display_height = VRAM_HEIGHT;
-    display_aspect_ratio = 1.0f;
-    CopyOut15Bit(m_vram.data(), VRAM_WIDTH, m_display_texture_buffer.data(), display_width, display_width,
-                 display_height);
+    CopyOut15Bit(m_vram.data(), VRAM_WIDTH, m_display_texture_buffer.data(), VRAM_WIDTH, VRAM_HEIGHT, VRAM_HEIGHT);
+    m_host_display->UpdateTexture(m_display_texture.get(), 0, 0, VRAM_WIDTH, VRAM_HEIGHT,
+                                  m_display_texture_buffer.data(), VRAM_WIDTH * sizeof(u32));
+    m_host_display->SetDisplayTexture(m_display_texture->GetHandle(), VRAM_WIDTH, VRAM_HEIGHT, 0, 0, VRAM_WIDTH,
+                                      VRAM_HEIGHT);
+    m_host_display->SetDisplayParameters(VRAM_WIDTH, VRAM_HEIGHT, Common::Rectangle<s32>(0, 0, VRAM_WIDTH, VRAM_HEIGHT),
+                                         1.0f);
   }
-
-  m_host_display->UpdateTexture(m_display_texture.get(), 0, 0, display_width, display_height,
-                                m_display_texture_buffer.data(), display_width * sizeof(u32));
-  m_host_display->SetDisplayTexture(m_display_texture->GetHandle(), 0, 0, display_width, display_height, VRAM_WIDTH,
-                                    VRAM_HEIGHT, display_aspect_ratio);
 }
 
 void GPU_SW::DispatchRenderCommand(RenderCommand rc, u32 num_vertices, const u32* command_ptr)
@@ -540,9 +509,9 @@ void GPU_SW::ShadePixel(u32 x, u32 y, u8 color_r, u8 color_g, u8 color_b, u8 tex
       const u8 g = Truncate8(std::min<u16>((ZeroExtend16(texture_color.GetG8()) * ZeroExtend16(color_g)) >> 7, 0xFF));
       const u8 b = Truncate8(std::min<u16>((ZeroExtend16(texture_color.GetB8()) * ZeroExtend16(color_b)) >> 7, 0xFF));
       if constexpr (dithering_enable)
-        color.SetRGB24Dithered(x, y, r, g, b);
+        color.SetRGB24Dithered(x, y, r, g, b, texture_color.c);
       else
-        color.SetRGB24(r, g, b);
+        color.SetRGB24(r, g, b, texture_color.c);
     }
   }
   else
@@ -555,12 +524,11 @@ void GPU_SW::ShadePixel(u32 x, u32 y, u8 color_r, u8 color_g, u8 color_b, u8 tex
       color.SetRGB24(color_r, color_g, color_b);
   }
 
+  const VRAMPixel bg_color{GetPixel(static_cast<u32>(x), static_cast<u32>(y))};
   if constexpr (transparency_enable)
   {
     if (transparent)
     {
-      const VRAMPixel bg_color{GetPixel(static_cast<u32>(x), static_cast<u32>(y))};
-
 #define BLEND_AVERAGE(bg, fg) Truncate8(std::min<u32>((ZeroExtend32(bg) / 2) + (ZeroExtend32(fg) / 2), 0x1F))
 #define BLEND_ADD(bg, fg) Truncate8(std::min<u32>(ZeroExtend32(bg) + ZeroExtend32(fg), 0x1F))
 #define BLEND_SUBTRACT(bg, fg) Truncate8((bg > fg) ? ((bg) - (fg)) : 0)
@@ -602,7 +570,7 @@ void GPU_SW::ShadePixel(u32 x, u32 y, u8 color_r, u8 color_g, u8 color_b, u8 tex
   }
 
   const u16 mask_and = m_GPUSTAT.GetMaskAND();
-  if ((color.bits & mask_and) != mask_and)
+  if ((bg_color.bits & mask_and) != 0)
     return;
 
   SetPixel(static_cast<u32>(x), static_cast<u32>(y), color.bits | m_GPUSTAT.GetMaskOR());

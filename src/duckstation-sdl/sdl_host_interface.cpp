@@ -7,59 +7,96 @@
 #include "core/gpu.h"
 #include "core/host_display.h"
 #include "core/system.h"
-#include "icon.h"
+#include "frontend-common/icon.h"
+#include "frontend-common/imgui_styles.h"
+#include "frontend-common/ini_settings_interface.h"
+#include "frontend-common/sdl_audio_stream.h"
+#include "frontend-common/sdl_controller_interface.h"
 #include "imgui_impl_sdl.h"
-#include "imgui_styles.h"
 #include "opengl_host_display.h"
-#include "sdl_audio_stream.h"
-#include "sdl_settings_interface.h"
 #include <cinttypes>
+#include <cmath>
 #include <imgui.h>
 #include <imgui_stdlib.h>
 #include <nfd.h>
 Log_SetChannel(SDLHostInterface);
 
 #ifdef WIN32
-#include "common/windows_headers.h"
 #include "d3d11_host_display.h"
-#include <mmsystem.h>
 #endif
 
 SDLHostInterface::SDLHostInterface()
 {
-  // Increase timer/sleep resolution since we use it for throttling.
-#ifdef WIN32
-  timeBeginPeriod(1);
-#endif
-
-  m_switch_gpu_renderer_event_id = SDL_RegisterEvents(1);
+  m_run_later_event_id = SDL_RegisterEvents(1);
 }
 
 SDLHostInterface::~SDLHostInterface()
 {
-  CloseGameControllers();
-  m_display.reset();
-  ImGui::DestroyContext();
+  g_sdl_controller_interface.Shutdown();
+  if (m_display)
+  {
+    DestroyDisplay();
+    ImGui::DestroyContext();
+  }
 
   if (m_window)
-    SDL_DestroyWindow(m_window);
+    DestroySDLWindow();
+}
 
-#ifdef WIN32
-  timeEndPeriod(1);
+float SDLHostInterface::GetDPIScaleFactor(SDL_Window* window)
+{
+#ifdef __APPLE__
+  static constexpr float DEFAULT_DPI = 72.0f;
+#else
+  static constexpr float DEFAULT_DPI = 96.0f;
 #endif
+
+  if (!window)
+  {
+    SDL_Window* dummy_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1, 1,
+                                                SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN);
+    if (!dummy_window)
+      return 1.0f;
+
+    const float scale = GetDPIScaleFactor(dummy_window);
+
+    SDL_DestroyWindow(dummy_window);
+
+    return scale;
+  }
+
+  int display_index = SDL_GetWindowDisplayIndex(window);
+  float display_dpi = DEFAULT_DPI;
+  if (SDL_GetDisplayDPI(display_index, &display_dpi, nullptr, nullptr) != 0)
+    return 1.0f;
+
+  return display_dpi / DEFAULT_DPI;
 }
 
 bool SDLHostInterface::CreateSDLWindow()
 {
-  constexpr u32 DEFAULT_WINDOW_WIDTH = 900;
-  constexpr u32 DEFAULT_WINDOW_HEIGHT = 700;
+  static constexpr u32 DEFAULT_WINDOW_WIDTH = 900;
+  static constexpr u32 DEFAULT_WINDOW_HEIGHT = 700;
 
   // Create window.
   const u32 window_flags =
     SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (UseOpenGLRenderer() ? SDL_WINDOW_OPENGL : 0);
 
-  m_window = SDL_CreateWindow("DuckStation", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, DEFAULT_WINDOW_WIDTH,
-                              DEFAULT_WINDOW_HEIGHT, window_flags);
+  u32 window_width = DEFAULT_WINDOW_WIDTH;
+  u32 window_height = DEFAULT_WINDOW_HEIGHT;
+
+  // macOS does DPI scaling differently..
+#ifndef __APPLE__
+  {
+    // scale by default monitor's DPI
+    float scale = GetDPIScaleFactor(nullptr);
+    window_width = static_cast<u32>(std::round(static_cast<float>(window_width) * scale));
+    window_height = static_cast<u32>(std::round(static_cast<float>(window_height) * scale));
+  }
+#endif
+
+  m_window = SDL_CreateWindow("DuckStation", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, window_width,
+                              window_height, window_flags);
   if (!m_window)
     return false;
 
@@ -74,6 +111,9 @@ bool SDLHostInterface::CreateSDLWindow()
     SDL_FreeSurface(icon_surface);
   }
 
+  if (m_fullscreen)
+    SDL_SetWindowFullscreen(m_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+
   return true;
 }
 
@@ -86,164 +126,192 @@ void SDLHostInterface::DestroySDLWindow()
 bool SDLHostInterface::CreateDisplay()
 {
   const bool debug_device = m_settings.gpu_use_debug_device;
+  std::unique_ptr<HostDisplay> display;
 #ifdef WIN32
-  m_display = UseOpenGLRenderer() ? OpenGLHostDisplay::Create(m_window, debug_device) :
-                                    D3D11HostDisplay::Create(m_window, debug_device);
+  display = UseOpenGLRenderer() ? OpenGLHostDisplay::Create(m_window, debug_device) :
+                                  D3D11HostDisplay::Create(m_window, debug_device);
 #else
-  m_display = OpenGLHostDisplay::Create(m_window, debug_device);
+  display = OpenGLHostDisplay::Create(m_window, debug_device);
 #endif
 
-  if (!m_display)
+  if (!display)
     return false;
-
-  m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
 
   m_app_icon_texture =
-    m_display->CreateTexture(APP_ICON_WIDTH, APP_ICON_HEIGHT, APP_ICON_DATA, APP_ICON_WIDTH * sizeof(u32));
-  if (!m_app_icon_texture)
+    display->CreateTexture(APP_ICON_WIDTH, APP_ICON_HEIGHT, APP_ICON_DATA, APP_ICON_WIDTH * sizeof(u32));
+  if (!display)
     return false;
 
+  display->SetDisplayTopMargin(m_fullscreen ? 0 : static_cast<int>(20.0f * ImGui::GetIO().DisplayFramebufferScale.x));
+  m_display = display.release();
   return true;
 }
 
 void SDLHostInterface::DestroyDisplay()
 {
   m_app_icon_texture.reset();
-  m_display.reset();
+  delete m_display;
+  m_display = nullptr;
 }
 
 void SDLHostInterface::CreateImGuiContext()
 {
+  const float framebuffer_scale = GetDPIScaleFactor(m_window);
+
   ImGui::CreateContext();
   ImGui::GetIO().IniFilename = nullptr;
   ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  ImGui::GetIO().DisplayFramebufferScale.x = framebuffer_scale;
+  ImGui::GetIO().DisplayFramebufferScale.y = framebuffer_scale;
+  ImGui::GetStyle().ScaleAllSizes(framebuffer_scale);
 
   ImGui::StyleColorsDarker();
-  ImGui::AddRobotoRegularFont();
+  ImGui::AddRobotoRegularFont(15.0f * framebuffer_scale);
 }
 
-void SDLHostInterface::CreateAudioStream()
+void SDLHostInterface::UpdateFramebufferScale()
 {
-  switch (m_settings.audio_backend)
+  const float framebuffer_scale = GetDPIScaleFactor(m_window);
+  ImGui::GetIO().DisplayFramebufferScale.x = framebuffer_scale;
+  ImGui::GetIO().DisplayFramebufferScale.y = framebuffer_scale;
+}
+
+bool SDLHostInterface::AcquireHostDisplay()
+{
+  // Handle renderer switch if required on Windows.
+#ifdef WIN32
+  const HostDisplay::RenderAPI render_api = m_display->GetRenderAPI();
+  const bool render_api_is_gl =
+    render_api == HostDisplay::RenderAPI::OpenGL || render_api == HostDisplay::RenderAPI::OpenGLES;
+  const bool render_api_wants_gl = UseOpenGLRenderer();
+  if (render_api_is_gl != render_api_wants_gl)
+  {
+    ImGui::EndFrame();
+    DestroyDisplay();
+    DestroySDLWindow();
+
+    if (!CreateSDLWindow())
+      Panic("Failed to recreate SDL window on GPU renderer switch");
+
+    if (!CreateDisplay())
+      Panic("Failed to recreate display on GPU renderer switch");
+
+    ImGui::NewFrame();
+  }
+#endif
+
+  return true;
+}
+
+void SDLHostInterface::ReleaseHostDisplay()
+{
+  // restore vsync, since we don't want to burn cycles at the menu
+  m_display->SetVSync(true);
+}
+
+std::unique_ptr<AudioStream> SDLHostInterface::CreateAudioStream(AudioBackend backend)
+{
+  switch (backend)
   {
     case AudioBackend::Null:
-      m_audio_stream = AudioStream::CreateNullAudioStream();
-      break;
+      return AudioStream::CreateNullAudioStream();
 
     case AudioBackend::Cubeb:
-      m_audio_stream = AudioStream::CreateCubebAudioStream();
-      break;
+      return AudioStream::CreateCubebAudioStream();
 
-    case AudioBackend::Default:
+    case AudioBackend::SDL:
+      return SDLAudioStream::Create();
+
     default:
-      m_audio_stream = std::make_unique<SDLAudioStream>();
-      break;
+      return nullptr;
   }
+}
 
-  if (!m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS))
-  {
-    ReportError("Failed to recreate audio stream, falling back to null");
-    m_audio_stream.reset();
-    m_audio_stream = AudioStream::CreateNullAudioStream();
-    if (!m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS))
-      Panic("Failed to reconfigure null audio stream");
-  }
+void SDLHostInterface::OnSystemCreated()
+{
+  HostInterface::OnSystemCreated();
+
+  UpdateKeyboardControllerMapping();
+  g_sdl_controller_interface.SetDefaultBindings();
+  ClearImGuiFocus();
+}
+
+void SDLHostInterface::OnSystemPaused(bool paused)
+{
+  HostInterface::OnSystemPaused(paused);
+
+  if (!paused)
+    ClearImGuiFocus();
+}
+
+void SDLHostInterface::OnSystemDestroyed()
+{
+  HostInterface::OnSystemDestroyed();
+}
+
+void SDLHostInterface::OnControllerTypeChanged(u32 slot)
+{
+  HostInterface::OnControllerTypeChanged(slot);
+
+  UpdateKeyboardControllerMapping();
+  g_sdl_controller_interface.SetDefaultBindings();
+}
+
+void SDLHostInterface::RunLater(std::function<void()> callback)
+{
+  SDL_Event ev = {};
+  ev.type = SDL_USEREVENT;
+  ev.user.code = m_run_later_event_id;
+  ev.user.data1 = new std::function<void()>(std::move(callback));
+  SDL_PushEvent(&ev);
 }
 
 void SDLHostInterface::SaveSettings()
 {
-  SDLSettingsInterface si(GetSettingsFileName().c_str());
-  m_settings.Save(si);
+  INISettingsInterface si(GetSettingsFileName().c_str());
+  m_settings_copy.Save(si);
 }
 
-void SDLHostInterface::QueueSwitchGPURenderer()
+void SDLHostInterface::UpdateSettings()
 {
-  SDL_Event ev = {};
-  ev.type = SDL_USEREVENT;
-  ev.user.code = m_switch_gpu_renderer_event_id;
-  SDL_PushEvent(&ev);
+  HostInterface::UpdateSettings([this]() { m_settings = m_settings_copy; });
 }
 
-void SDLHostInterface::SwitchGPURenderer()
+void SDLHostInterface::SetFullscreen(bool enabled)
 {
-  // Due to the GPU class owning textures, we have to shut the system down.
-  std::unique_ptr<ByteStream> stream;
-  if (m_system)
-  {
-    stream = ByteStream_CreateGrowableMemoryStream(nullptr, 8 * 1024);
-    if (!m_system->SaveState(stream.get()) || !stream->SeekAbsolute(0))
-      ReportError("Failed to save state before GPU renderer switch");
+  if (m_fullscreen == enabled)
+    return;
 
-    DestroySystem();
-  }
-
-  ImGui::EndFrame();
-  DestroyDisplay();
-  DestroySDLWindow();
-
-  if (!CreateSDLWindow())
-    Panic("Failed to recreate SDL window on GPU renderer switch");
-
-  if (!CreateDisplay())
-    Panic("Failed to recreate display on GPU renderer switch");
-
-  ImGui::NewFrame();
-
-  if (stream)
-  {
-    CreateSystem();
-    if (!BootSystem(nullptr, nullptr) || !m_system->LoadState(stream.get()))
-    {
-      ReportError("Failed to load state after GPU renderer switch, resetting");
-      m_system->Reset();
-    }
-  }
-
-  UpdateFullscreen();
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
-}
-
-void SDLHostInterface::SwitchAudioBackend()
-{
-  m_audio_stream.reset();
-  CreateAudioStream();
-
-  if (m_system)
-  {
-    m_audio_stream->PauseOutput(false);
-    UpdateSpeedLimiterState();
-  }
-}
-
-void SDLHostInterface::UpdateFullscreen()
-{
-  SDL_SetWindowFullscreen(m_window, m_settings.display_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+  SDL_SetWindowFullscreen(m_window, enabled ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 
   // We set the margin only in windowed mode, the menu bar is drawn on top in fullscreen.
-  m_display->SetDisplayTopMargin(
-    m_settings.display_fullscreen ? 0 : static_cast<int>(20.0f * ImGui::GetIO().DisplayFramebufferScale.x));
+  m_display->SetDisplayTopMargin(enabled ? 0 : static_cast<int>(20.0f * ImGui::GetIO().DisplayFramebufferScale.x));
+
+  int window_width, window_height;
+  SDL_GetWindowSize(m_window, &window_width, &window_height);
+  m_display->WindowResized(window_width, window_height);
+  m_fullscreen = enabled;
 }
 
-void SDLHostInterface::UpdateControllerMapping()
-{
-  UpdateKeyboardControllerMapping();
-  UpdateControllerControllerMapping();
-}
-
-std::unique_ptr<SDLHostInterface> SDLHostInterface::Create(const char* filename /* = nullptr */,
-                                                           const char* exp1_filename /* = nullptr */,
-                                                           const char* save_state_filename /* = nullptr */)
+std::unique_ptr<SDLHostInterface> SDLHostInterface::Create()
 {
   std::unique_ptr<SDLHostInterface> intf = std::make_unique<SDLHostInterface>();
 
   // Settings need to be loaded prior to creating the window for OpenGL bits.
-  SDLSettingsInterface si(intf->GetSettingsFileName().c_str());
-  intf->m_settings.Load(si);
+  INISettingsInterface si(intf->GetSettingsFileName().c_str());
+  intf->m_settings_copy.Load(si);
+  intf->m_settings = intf->m_settings_copy;
+  intf->m_fullscreen = intf->m_settings_copy.display_fullscreen;
 
   if (!intf->CreateSDLWindow())
   {
     Log_ErrorPrintf("Failed to create SDL window");
+    return nullptr;
+  }
+
+  if (!g_sdl_controller_interface.Initialize(intf.get()))
+  {
+    Log_ErrorPrintf("Failed to initialize controller interface.");
     return nullptr;
   }
 
@@ -254,54 +322,64 @@ std::unique_ptr<SDLHostInterface> SDLHostInterface::Create(const char* filename 
     return nullptr;
   }
 
-  intf->CreateAudioStream();
-
   ImGui::NewFrame();
-
-  intf->UpdateSpeedLimiterState();
-
-  const bool boot = (filename != nullptr || exp1_filename != nullptr || save_state_filename != nullptr);
-  if (boot)
-  {
-    if (!intf->CreateSystem() || !intf->BootSystem(filename, exp1_filename))
-      return nullptr;
-
-    if (save_state_filename)
-      intf->LoadState(save_state_filename);
-
-    intf->UpdateControllerMapping();
-  }
-
-  intf->UpdateFullscreen();
 
   return intf;
 }
 
-std::string SDLHostInterface::GetSaveStateFilename(u32 index)
-{
-  return StringUtil::StdStringFromFormat("savestate_%u.bin", index);
-}
-
 void SDLHostInterface::ReportError(const char* message)
 {
-  SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DuckStation Error", message, m_window);
+  SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DuckStation", message, m_window);
 }
 
 void SDLHostInterface::ReportMessage(const char* message)
 {
-  SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "DuckStation Information", message, m_window);
+  AddOSDMessage(message, 2.0f);
+}
+
+bool SDLHostInterface::ConfirmMessage(const char* message)
+{
+  SDL_MessageBoxData mbd = {};
+  mbd.flags = SDL_MESSAGEBOX_INFORMATION;
+  mbd.window = m_window;
+  mbd.title = "DuckStation";
+  mbd.message = message;
+  mbd.numbuttons = 2;
+
+  // Why the heck these are reversed I have no idea...
+  SDL_MessageBoxButtonData buttons[2] = {};
+  buttons[1].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+  buttons[1].buttonid = 0;
+  buttons[1].text = "Yes";
+  buttons[0].flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+  buttons[0].buttonid = 1;
+  buttons[0].text = "No";
+  mbd.buttons = buttons;
+  mbd.numbuttons = countof(buttons);
+
+  int button_id = 0;
+  SDL_ShowMessageBox(&mbd, &button_id);
+  return (button_id == 0);
 }
 
 void SDLHostInterface::HandleSDLEvent(const SDL_Event* event)
 {
   ImGui_ImplSDL2_ProcessEvent(event);
+  g_sdl_controller_interface.ProcessSDLEvent(event);
 
   switch (event->type)
   {
     case SDL_WINDOWEVENT:
     {
       if (event->window.event == SDL_WINDOWEVENT_RESIZED)
-        m_display->WindowResized();
+      {
+        m_display->WindowResized(event->window.data1, event->window.data2);
+        UpdateFramebufferScale();
+      }
+      else if (event->window.event == SDL_WINDOWEVENT_MOVED)
+      {
+        UpdateFramebufferScale();
+      }
     }
     break;
 
@@ -318,21 +396,8 @@ void SDLHostInterface::HandleSDLEvent(const SDL_Event* event)
     break;
 
     case SDL_CONTROLLERDEVICEADDED:
-    {
-      Log_InfoPrintf("Controller %d inserted", event->cdevice.which);
-      OpenGameController(event->cdevice.which);
-    }
-    break;
-
     case SDL_CONTROLLERDEVICEREMOVED:
-    {
-      Log_InfoPrintf("Controller %d removed", event->cdevice.which);
-      CloseGameController(event->cdevice.which);
-    }
-    break;
-
-    case SDL_CONTROLLERAXISMOTION:
-      HandleSDLControllerAxisEventForController(event);
+      g_sdl_controller_interface.SetDefaultBindings();
       break;
 
     case SDL_CONTROLLERBUTTONDOWN:
@@ -343,15 +408,18 @@ void SDLHostInterface::HandleSDLEvent(const SDL_Event* event)
         // focus the menu bar
         m_focus_main_menu_bar = true;
       }
-
-      HandleSDLControllerButtonEventForController(event);
     }
     break;
 
     case SDL_USEREVENT:
     {
-      if (static_cast<u32>(event->user.code) == m_switch_gpu_renderer_event_id)
-        SwitchGPURenderer();
+      if (static_cast<u32>(event->user.code) == m_run_later_event_id)
+      {
+        std::function<void()>* callback = static_cast<std::function<void()>*>(event->user.data1);
+        Assert(callback);
+        (*callback)();
+        delete callback;
+      }
     }
     break;
   }
@@ -379,17 +447,18 @@ void SDLHostInterface::HandleSDLKeyEvent(const SDL_Event* event)
       {
         const u32 index = event->key.keysym.scancode - SDL_SCANCODE_F1 + 1;
         if (event->key.keysym.mod & (KMOD_LSHIFT | KMOD_RSHIFT))
-          DoSaveState(index);
+          SaveState(true, index);
         else
-          DoLoadState(index);
+          LoadState(true, index);
       }
     }
     break;
 
-    case SDL_SCANCODE_F11:
+    case SDL_SCANCODE_RETURN:
+    case SDL_SCANCODE_KP_ENTER:
     {
-      if (!pressed)
-        DoToggleFullscreen();
+      if ((event->key.keysym.mod & (KMOD_LALT | KMOD_RALT)) && !pressed)
+        SetFullscreen(!m_fullscreen);
     }
     break;
 
@@ -406,7 +475,7 @@ void SDLHostInterface::HandleSDLKeyEvent(const SDL_Event* event)
     case SDL_SCANCODE_PAUSE:
     {
       if (pressed)
-        DoTogglePause();
+        PauseSystem(!m_paused);
     }
     break;
 
@@ -422,9 +491,9 @@ void SDLHostInterface::HandleSDLKeyEvent(const SDL_Event* event)
       if (pressed && !repeat && m_system)
       {
         m_settings.speed_limiter_enabled = !m_settings.speed_limiter_enabled;
+        m_settings_copy.speed_limiter_enabled = m_settings.speed_limiter_enabled;
         UpdateSpeedLimiterState();
-        AddOSDMessage(m_system->GetSettings().speed_limiter_enabled ? "Speed limiter enabled." :
-                                                                      "Speed limiter disabled.");
+        AddOSDMessage(m_settings.speed_limiter_enabled ? "Speed limiter enabled." : "Speed limiter disabled.");
       }
     }
     break;
@@ -553,198 +622,6 @@ bool SDLHostInterface::HandleSDLKeyEventForController(const SDL_Event* event)
   return false;
 }
 
-bool SDLHostInterface::OpenGameController(int index)
-{
-  if (m_sdl_controllers.find(index) != m_sdl_controllers.end())
-    CloseGameController(index);
-
-  SDL_GameController* gcontroller = SDL_GameControllerOpen(index);
-  if (!gcontroller)
-  {
-    Log_WarningPrintf("Failed to open controller %d", index);
-    return false;
-  }
-
-  Log_InfoPrintf("Opened controller %d: %s", index, SDL_GameControllerName(gcontroller));
-
-  ControllerData cd = {};
-  cd.controller = gcontroller;
-
-  SDL_Joystick* joystick = SDL_GameControllerGetJoystick(gcontroller);
-  if (joystick)
-  {
-    SDL_Haptic* haptic = SDL_HapticOpenFromJoystick(joystick);
-    if (SDL_HapticRumbleSupported(haptic) && SDL_HapticRumbleInit(haptic) == 0)
-      cd.haptic = haptic;
-    else
-      SDL_HapticClose(haptic);
-  }
-
-  if (cd.haptic)
-    Log_InfoPrintf("Rumble is supported on '%s'", SDL_GameControllerName(gcontroller));
-  else
-    Log_WarningPrintf("Rumble is not supported on '%s'", SDL_GameControllerName(gcontroller));
-
-  m_sdl_controllers.emplace(index, cd);
-  return true;
-}
-
-void SDLHostInterface::CloseGameControllers()
-{
-  while (!m_sdl_controllers.empty())
-    CloseGameController(m_sdl_controllers.begin()->first);
-}
-
-bool SDLHostInterface::CloseGameController(int index)
-{
-  auto it = m_sdl_controllers.find(index);
-  if (it == m_sdl_controllers.end())
-    return false;
-
-  if (it->second.haptic)
-    SDL_HapticClose(it->second.haptic);
-
-  SDL_GameControllerClose(it->second.controller);
-  return true;
-}
-
-void SDLHostInterface::UpdateControllerControllerMapping()
-{
-  m_controller_axis_mapping.fill(-1);
-  m_controller_button_mapping.fill(-1);
-
-  Controller* controller = m_system ? m_system->GetController(0) : nullptr;
-  if (controller)
-  {
-#define SET_AXIS_MAP(axis, name) m_controller_axis_mapping[axis] = controller->GetAxisCodeByName(name).value_or(-1)
-#define SET_BUTTON_MAP(button, name)                                                                                   \
-  m_controller_button_mapping[button] = controller->GetButtonCodeByName(name).value_or(-1)
-
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_LEFTX, "LeftX");
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_LEFTY, "LeftY");
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_RIGHTX, "RightX");
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_RIGHTY, "RightY");
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_TRIGGERLEFT, "LeftTrigger");
-    SET_AXIS_MAP(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, "RightTrigger");
-
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_DPAD_UP, "Up");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_DPAD_DOWN, "Down");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_DPAD_LEFT, "Left");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "Right");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_Y, "Triangle");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_A, "Cross");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_X, "Square");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_B, "Circle");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "L1");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "R1");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_LEFTSTICK, "L3");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_RIGHTSTICK, "R3");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_START, "Start");
-    SET_BUTTON_MAP(SDL_CONTROLLER_BUTTON_BACK, "Select");
-
-#undef SET_AXIS_MAP
-#undef SET_BUTTON_MAP
-  }
-}
-
-void SDLHostInterface::HandleSDLControllerAxisEventForController(const SDL_Event* ev)
-{
-  // Log_DevPrintf("axis %d %d", ev->caxis.axis, ev->caxis.value);
-  Controller* controller = m_system ? m_system->GetController(0) : nullptr;
-  if (!controller)
-    return;
-
-  // proper axis mapping
-  if (m_controller_axis_mapping[ev->caxis.axis] >= 0)
-  {
-    const float value = static_cast<float>(ev->caxis.value) / (ev->caxis.value < 0 ? 32768.0f : 32767.0f);
-    controller->SetAxisState(m_controller_axis_mapping[ev->caxis.axis], value);
-    return;
-  }
-
-  // axis-as-button mapping
-  static constexpr int deadzone = 8192;
-  const bool negative = (ev->caxis.value < 0);
-  const bool active = (std::abs(ev->caxis.value) >= deadzone);
-
-  // FIXME
-  if (ev->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT)
-  {
-    auto button = controller->GetButtonCodeByName("L2");
-    if (button)
-      controller->SetButtonState(button.value(), active);
-  }
-  else if (ev->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
-  {
-    auto button = controller->GetButtonCodeByName("R2");
-    if (button)
-      controller->SetButtonState(button.value(), active);
-  }
-  else
-  {
-    SDL_GameControllerButton negative_button, positive_button;
-    if (ev->caxis.axis & 1)
-    {
-      negative_button = SDL_CONTROLLER_BUTTON_DPAD_UP;
-      positive_button = SDL_CONTROLLER_BUTTON_DPAD_DOWN;
-    }
-    else
-    {
-      negative_button = SDL_CONTROLLER_BUTTON_DPAD_LEFT;
-      positive_button = SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
-    }
-
-    if (m_controller_button_mapping[negative_button] >= 0)
-      controller->SetButtonState(m_controller_button_mapping[negative_button], negative && active);
-    if (m_controller_button_mapping[positive_button] >= 0)
-      controller->SetButtonState(m_controller_button_mapping[positive_button], !negative && active);
-  }
-}
-
-void SDLHostInterface::HandleSDLControllerButtonEventForController(const SDL_Event* ev)
-{
-  // Log_DevPrintf("button %d %s", ev->cbutton.button, ev->cbutton.state == SDL_PRESSED ? "pressed" : "released");
-
-  Controller* controller = m_system ? m_system->GetController(0) : nullptr;
-  if (!controller)
-    return;
-
-  if (m_controller_button_mapping[ev->cbutton.button] >= 0)
-    controller->SetButtonState(m_controller_button_mapping[ev->cbutton.button], ev->cbutton.state == SDL_PRESSED);
-}
-
-void SDLHostInterface::UpdateControllerRumble()
-{
-  for (auto& it : m_sdl_controllers)
-  {
-    ControllerData& cd = it.second;
-    if (!cd.haptic)
-      continue;
-
-    float new_strength = 0.0f;
-    if (m_system)
-    {
-      Controller* controller = m_system->GetController(cd.controller_index);
-      if (controller)
-      {
-        const u32 motor_count = controller->GetVibrationMotorCount();
-        for (u32 i = 0; i < motor_count; i++)
-          new_strength = std::max(new_strength, controller->GetVibrationMotorStrength(i));
-      }
-    }
-
-    if (cd.last_rumble_strength == new_strength)
-      continue;
-
-    if (new_strength > 0.01f)
-      SDL_HapticRumblePlay(cd.haptic, new_strength, 100000);
-    else
-      SDL_HapticRumbleStop(cd.haptic);
-
-    cd.last_rumble_strength = new_strength;
-  }
-}
-
 void SDLHostInterface::DrawImGui()
 {
   DrawMainMenuBar();
@@ -769,7 +646,7 @@ void SDLHostInterface::DrawMainMenuBar()
 {
   // We skip drawing the menu bar if we're in fullscreen and the mouse pointer isn't in range.
   const float SHOW_THRESHOLD = 20.0f;
-  if (m_settings.display_fullscreen &&
+  if (m_fullscreen && !m_system &&
       ImGui::GetIO().MousePos.y >= (SHOW_THRESHOLD * ImGui::GetIO().DisplayFramebufferScale.x) &&
       !ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow))
   {
@@ -790,51 +667,81 @@ void SDLHostInterface::DrawMainMenuBar()
   if (ImGui::BeginMenu("System"))
   {
     if (ImGui::MenuItem("Start Disc", nullptr, false, !system_enabled))
-      DoStartDisc();
+    {
+      RunLater([this]() { DoStartDisc(); });
+      ClearImGuiFocus();
+    }
     if (ImGui::MenuItem("Start BIOS", nullptr, false, !system_enabled))
-      DoStartBIOS();
+    {
+      RunLater([this]() {
+        SystemBootParameters boot_params;
+        BootSystem(boot_params);
+      });
+      ClearImGuiFocus();
+    }
 
     ImGui::Separator();
 
     if (ImGui::MenuItem("Power Off", nullptr, false, system_enabled))
-      DoPowerOff();
+    {
+      RunLater([this]() { DestroySystem(); });
+      ClearImGuiFocus();
+    }
 
     if (ImGui::MenuItem("Reset", nullptr, false, system_enabled))
-      ResetSystem();
+    {
+      RunLater([this]() { ResetSystem(); });
+      ClearImGuiFocus();
+    }
 
     if (ImGui::MenuItem("Pause", nullptr, m_paused, system_enabled))
-      DoTogglePause();
+    {
+      RunLater([this]() { PauseSystem(!m_paused); });
+      ClearImGuiFocus();
+    }
 
     ImGui::Separator();
 
     if (ImGui::MenuItem("Change Disc", nullptr, false, system_enabled))
-      DoChangeDisc();
+    {
+      RunLater([this]() { DoChangeDisc(); });
+      ClearImGuiFocus();
+    }
 
     if (ImGui::MenuItem("Frame Step", nullptr, false, system_enabled))
-      DoFrameStep();
+    {
+      RunLater([this]() { DoFrameStep(); });
+      ClearImGuiFocus();
+    }
 
     ImGui::Separator();
 
     if (ImGui::BeginMenu("Load State"))
     {
-      for (u32 i = 1; i <= NUM_QUICK_SAVE_STATES; i++)
+      for (u32 i = 1; i <= GLOBAL_SAVE_STATE_SLOTS; i++)
       {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "State %u", i);
         if (ImGui::MenuItem(buf))
-          DoLoadState(i);
+        {
+          RunLater([this, i]() { LoadState(true, i); });
+          ClearImGuiFocus();
+        }
       }
       ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu("Save State", system_enabled))
     {
-      for (u32 i = 1; i <= NUM_QUICK_SAVE_STATES; i++)
+      for (u32 i = 1; i <= GLOBAL_SAVE_STATE_SLOTS; i++)
       {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "State %u", i);
         if (ImGui::MenuItem(buf))
-          DoSaveState(i);
+        {
+          RunLater([this, i]() { SaveState(true, i); });
+          ClearImGuiFocus();
+        }
       }
       ImGui::EndMenu();
     }
@@ -882,27 +789,30 @@ void SDLHostInterface::DrawMainMenuBar()
 
   if (m_system)
   {
+    const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
     if (!m_paused)
     {
-      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - 210.0f);
+      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - (210.0f * framebuffer_scale));
 
-      const u32 rounded_speed = static_cast<u32>(std::round(m_speed));
-      if (m_speed < 90.0f)
+      const float speed = m_system->GetEmulationSpeed();
+      const u32 rounded_speed = static_cast<u32>(std::round(speed));
+      if (speed < 90.0f)
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%u%%", rounded_speed);
-      else if (m_speed < 110.0f)
+      else if (speed < 110.0f)
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%u%%", rounded_speed);
       else
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%u%%", rounded_speed);
 
-      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - 165.0f);
-      ImGui::Text("FPS: %.2f", m_fps);
+      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - (165.0f * framebuffer_scale));
+      ImGui::Text("FPS: %.2f", m_system->GetFPS());
 
-      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - 80.0f);
-      ImGui::Text("VPS: %.2f", m_vps);
+      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - (80.0f * framebuffer_scale));
+      ImGui::Text("VPS: %.2f", m_system->GetVPS());
     }
     else
     {
-      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - 50.0f);
+      ImGui::SetCursorPosX(ImGui::GetIO().DisplaySize.x - (50.0f * framebuffer_scale));
       ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Paused");
     }
   }
@@ -913,12 +823,7 @@ void SDLHostInterface::DrawMainMenuBar()
 void SDLHostInterface::DrawQuickSettingsMenu()
 {
   bool settings_changed = false;
-  bool gpu_settings_changed = false;
-  if (ImGui::MenuItem("Enable Speed Limiter", nullptr, &m_settings.speed_limiter_enabled))
-  {
-    settings_changed = true;
-    UpdateSpeedLimiterState();
-  }
+  settings_changed |= ImGui::MenuItem("Enable Speed Limiter", nullptr, &m_settings_copy.speed_limiter_enabled);
 
   ImGui::Separator();
 
@@ -930,10 +835,8 @@ void SDLHostInterface::DrawQuickSettingsMenu()
       if (ImGui::MenuItem(Settings::GetCPUExecutionModeDisplayName(static_cast<CPUExecutionMode>(i)), nullptr,
                           i == static_cast<u32>(current)))
       {
-        m_settings.cpu_execution_mode = static_cast<CPUExecutionMode>(i);
+        m_settings_copy.cpu_execution_mode = static_cast<CPUExecutionMode>(i);
         settings_changed = true;
-        if (m_system)
-          m_system->SetCPUExecutionMode(m_settings.cpu_execution_mode);
       }
     }
 
@@ -944,102 +847,112 @@ void SDLHostInterface::DrawQuickSettingsMenu()
 
   if (ImGui::BeginMenu("Renderer"))
   {
-    const GPURenderer current = m_settings.gpu_renderer;
+    const GPURenderer current = m_settings_copy.gpu_renderer;
     for (u32 i = 0; i < static_cast<u32>(GPURenderer::Count); i++)
     {
       if (ImGui::MenuItem(Settings::GetRendererDisplayName(static_cast<GPURenderer>(i)), nullptr,
                           i == static_cast<u32>(current)))
       {
-        m_settings.gpu_renderer = static_cast<GPURenderer>(i);
+        m_settings_copy.gpu_renderer = static_cast<GPURenderer>(i);
         settings_changed = true;
-        QueueSwitchGPURenderer();
       }
     }
 
     ImGui::EndMenu();
   }
 
-  if (ImGui::MenuItem("Fullscreen", nullptr, &m_settings.display_fullscreen))
-  {
-    settings_changed = true;
-    UpdateFullscreen();
-  }
+  bool fullscreen = m_fullscreen;
+  if (ImGui::MenuItem("Fullscreen", nullptr, &fullscreen))
+    RunLater([this, fullscreen] { SetFullscreen(fullscreen); });
 
-  if (ImGui::MenuItem("VSync", nullptr, &m_settings.video_sync_enabled))
-  {
-    settings_changed = true;
-    UpdateSpeedLimiterState();
-  }
+  settings_changed |= ImGui::MenuItem("VSync", nullptr, &m_settings_copy.video_sync_enabled);
 
   ImGui::Separator();
 
   if (ImGui::BeginMenu("Resolution Scale"))
   {
-    const u32 current_internal_resolution = m_settings.gpu_resolution_scale;
-    for (u32 scale = 1; scale <= m_settings.max_gpu_resolution_scale; scale++)
+    const u32 current_internal_resolution = m_settings_copy.gpu_resolution_scale;
+    for (u32 scale = 1; scale <= GPU::MAX_RESOLUTION_SCALE; scale++)
     {
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%ux (%ux%u)", scale, scale * GPU::VRAM_WIDTH, scale * GPU::VRAM_HEIGHT);
 
       if (ImGui::MenuItem(buf, nullptr, current_internal_resolution == scale))
       {
-        m_settings.gpu_resolution_scale = scale;
-        gpu_settings_changed = true;
+        m_settings_copy.gpu_resolution_scale = scale;
+        settings_changed = true;
       }
     }
 
     ImGui::EndMenu();
   }
 
-  gpu_settings_changed |= ImGui::MenuItem("True (24-Bit) Color", nullptr, &m_settings.gpu_true_color);
-  gpu_settings_changed |= ImGui::MenuItem("Texture Filtering", nullptr, &m_settings.gpu_texture_filtering);
-  if (ImGui::MenuItem("Display Linear Filtering", nullptr, &m_settings.display_linear_filtering))
+  settings_changed |= ImGui::MenuItem("True (24-Bit) Color", nullptr, &m_settings_copy.gpu_true_color);
+  settings_changed |= ImGui::MenuItem("Scaled Dithering", nullptr, &m_settings_copy.gpu_scaled_dithering);
+  settings_changed |= ImGui::MenuItem("Texture Filtering", nullptr, &m_settings_copy.gpu_texture_filtering);
+  settings_changed |= ImGui::MenuItem("Display Linear Filtering", nullptr, &m_settings_copy.display_linear_filtering);
+
+  if (settings_changed)
   {
-    m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
-    settings_changed = true;
+    RunLater([this]() {
+      SaveSettings();
+      UpdateSettings();
+    });
   }
-
-  if (settings_changed || gpu_settings_changed)
-    SaveSettings();
-
-  if (gpu_settings_changed && m_system)
-    m_system->GetGPU()->UpdateSettings();
 }
 
 void SDLHostInterface::DrawDebugMenu()
 {
   Settings::DebugSettings& debug_settings = m_settings.debugging;
+  bool settings_changed = false;
 
   ImGui::MenuItem("Show System State");
   ImGui::Separator();
 
-  ImGui::MenuItem("Show GPU State", nullptr, &debug_settings.show_gpu_state);
-  ImGui::MenuItem("Show VRAM", nullptr, &debug_settings.show_vram);
-  ImGui::MenuItem("Dump CPU to VRAM Copies", nullptr, &debug_settings.dump_cpu_to_vram_copies);
-  ImGui::MenuItem("Dump VRAM to CPU Copies", nullptr, &debug_settings.dump_vram_to_cpu_copies);
+  settings_changed |= ImGui::MenuItem("Show GPU State", nullptr, &debug_settings.show_gpu_state);
+  settings_changed |= ImGui::MenuItem("Show VRAM", nullptr, &debug_settings.show_vram);
+  settings_changed |= ImGui::MenuItem("Dump CPU to VRAM Copies", nullptr, &debug_settings.dump_cpu_to_vram_copies);
+  settings_changed |= ImGui::MenuItem("Dump VRAM to CPU Copies", nullptr, &debug_settings.dump_vram_to_cpu_copies);
   ImGui::Separator();
 
-  ImGui::MenuItem("Show CDROM State", nullptr, &debug_settings.show_cdrom_state);
+  settings_changed |= ImGui::MenuItem("Show CDROM State", nullptr, &debug_settings.show_cdrom_state);
   ImGui::Separator();
 
-  ImGui::MenuItem("Show SPU State", nullptr, &debug_settings.show_spu_state);
+  settings_changed |= ImGui::MenuItem("Show SPU State", nullptr, &debug_settings.show_spu_state);
   ImGui::Separator();
 
-  ImGui::MenuItem("Show Timers State", nullptr, &debug_settings.show_timers_state);
+  settings_changed |= ImGui::MenuItem("Show Timers State", nullptr, &debug_settings.show_timers_state);
   ImGui::Separator();
 
-  ImGui::MenuItem("Show MDEC State", nullptr, &debug_settings.show_mdec_state);
+  settings_changed |= ImGui::MenuItem("Show MDEC State", nullptr, &debug_settings.show_mdec_state);
   ImGui::Separator();
+
+  if (settings_changed)
+  {
+    // have to apply it to the copy too, otherwise it won't save
+    Settings::DebugSettings& debug_settings_copy = m_settings_copy.debugging;
+    debug_settings_copy.show_gpu_state = debug_settings.show_gpu_state;
+    debug_settings_copy.show_vram = debug_settings.show_vram;
+    debug_settings_copy.dump_cpu_to_vram_copies = debug_settings.dump_cpu_to_vram_copies;
+    debug_settings_copy.dump_vram_to_cpu_copies = debug_settings.dump_vram_to_cpu_copies;
+    debug_settings_copy.show_cdrom_state = debug_settings.show_cdrom_state;
+    debug_settings_copy.show_spu_state = debug_settings.show_spu_state;
+    debug_settings_copy.show_timers_state = debug_settings.show_timers_state;
+    debug_settings_copy.show_mdec_state = debug_settings.show_mdec_state;
+    SaveSettings();
+  }
 }
 
 void SDLHostInterface::DrawPoweredOffWindow()
 {
-  constexpr int WINDOW_WIDTH = 400;
-  constexpr int WINDOW_HEIGHT = 650;
-  constexpr int BUTTON_WIDTH = 200;
-  constexpr int BUTTON_HEIGHT = 40;
+  static constexpr int WINDOW_WIDTH = 400;
+  static constexpr int WINDOW_HEIGHT = 650;
+  static constexpr int BUTTON_WIDTH = 200;
+  static constexpr int BUTTON_HEIGHT = 40;
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
 
-  ImGui::SetNextWindowSize(ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT));
+  ImGui::SetNextWindowSize(ImVec2(static_cast<float>(WINDOW_WIDTH) * framebuffer_scale,
+                                  static_cast<float>(WINDOW_HEIGHT) * framebuffer_scale));
   ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f),
                           ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 
@@ -1051,32 +964,46 @@ void SDLHostInterface::DrawPoweredOffWindow()
     ImGui::End();
   }
 
-  ImGui::SetCursorPosX((WINDOW_WIDTH - APP_ICON_WIDTH) / 2);
-  ImGui::Image(m_app_icon_texture->GetHandle(), ImVec2(APP_ICON_WIDTH, APP_ICON_HEIGHT));
-  ImGui::SetCursorPosY(APP_ICON_HEIGHT + 32);
+  ImGui::SetCursorPosX(static_cast<float>((WINDOW_WIDTH - APP_ICON_WIDTH) / 2) * framebuffer_scale);
+  ImGui::Image(m_app_icon_texture->GetHandle(), ImVec2(static_cast<float>(APP_ICON_WIDTH) * framebuffer_scale,
+                                                       static_cast<float>(APP_ICON_HEIGHT) * framebuffer_scale));
+  ImGui::SetCursorPosY(static_cast<float>(APP_ICON_HEIGHT + 32) * framebuffer_scale);
 
-  static const ImVec2 button_size(static_cast<float>(BUTTON_WIDTH), static_cast<float>(BUTTON_HEIGHT));
-  constexpr float button_left = static_cast<float>((WINDOW_WIDTH - BUTTON_WIDTH) / 2);
+  const ImVec2 button_size(static_cast<float>(BUTTON_WIDTH) * framebuffer_scale,
+                           static_cast<float>(BUTTON_HEIGHT) * framebuffer_scale);
+  const float button_left = static_cast<float>((WINDOW_WIDTH - BUTTON_WIDTH) / 2) * framebuffer_scale;
 
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f * framebuffer_scale);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f * framebuffer_scale);
   ImGui::PushStyleColor(ImGuiCol_Button, 0xFF202020);
   ImGui::PushStyleColor(ImGuiCol_ButtonActive, 0xFF808080);
   ImGui::PushStyleColor(ImGuiCol_ButtonHovered, 0xFF575757);
 
   ImGui::SetCursorPosX(button_left);
   if (ImGui::Button("Resume", button_size))
-    DoResume();
+  {
+    RunLater([this]() { ResumeSystemFromMostRecentState(); });
+    ClearImGuiFocus();
+  }
   ImGui::NewLine();
 
   ImGui::SetCursorPosX(button_left);
   if (ImGui::Button("Start Disc", button_size))
-    DoStartDisc();
+  {
+    RunLater([this]() { DoStartDisc(); });
+    ClearImGuiFocus();
+  }
   ImGui::NewLine();
 
   ImGui::SetCursorPosX(button_left);
   if (ImGui::Button("Start BIOS", button_size))
-    DoStartBIOS();
+  {
+    RunLater([this]() {
+      SystemBootParameters boot_params;
+      BootSystem(boot_params);
+    });
+    ClearImGuiFocus();
+  }
   ImGui::NewLine();
 
   ImGui::SetCursorPosX(button_left);
@@ -1084,12 +1011,15 @@ void SDLHostInterface::DrawPoweredOffWindow()
     ImGui::OpenPopup("PowerOffWindow_LoadStateMenu");
   if (ImGui::BeginPopup("PowerOffWindow_LoadStateMenu"))
   {
-    for (u32 i = 1; i <= NUM_QUICK_SAVE_STATES; i++)
+    for (u32 i = 1; i <= GLOBAL_SAVE_STATE_SLOTS; i++)
     {
       char buf[16];
       std::snprintf(buf, sizeof(buf), "State %u", i);
       if (ImGui::MenuItem(buf))
-        DoLoadState(i);
+      {
+        RunLater([this, i]() { LoadState(true, i); });
+        ClearImGuiFocus();
+      }
     }
     ImGui::EndPopup();
   }
@@ -1119,9 +1049,11 @@ static bool DrawSettingsSectionHeader(const char* title)
 
 void SDLHostInterface::DrawSettingsWindow()
 {
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
   ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f),
                           ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
-  ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(500 * framebuffer_scale, 400.0f * framebuffer_scale), ImGuiCond_FirstUseEver);
 
   if (!ImGui::Begin("Settings", &m_settings_window_open, ImGuiWindowFlags_NoResize))
   {
@@ -1130,11 +1062,10 @@ void SDLHostInterface::DrawSettingsWindow()
   }
 
   bool settings_changed = false;
-  bool gpu_settings_changed = false;
 
   if (ImGui::BeginTabBar("SettingsTabBar", 0))
   {
-    const float indent = 150.0f;
+    const float indent = 150.0f * framebuffer_scale;
 
     if (ImGui::BeginTabItem("General"))
     {
@@ -1143,7 +1074,7 @@ void SDLHostInterface::DrawSettingsWindow()
         ImGui::Text("Region:");
         ImGui::SameLine(indent);
 
-        int region = static_cast<int>(m_settings.region);
+        int region = static_cast<int>(m_settings_copy.region);
         if (ImGui::Combo(
               "##region", &region,
               [](void*, int index, const char** out_text) {
@@ -1152,28 +1083,35 @@ void SDLHostInterface::DrawSettingsWindow()
               },
               nullptr, static_cast<int>(ConsoleRegion::Count)))
         {
-          m_settings.region = static_cast<ConsoleRegion>(region);
+          m_settings_copy.region = static_cast<ConsoleRegion>(region);
           settings_changed = true;
         }
 
         ImGui::Text("BIOS Path:");
         ImGui::SameLine(indent);
-        settings_changed |= DrawFileChooser("##bios_path", &m_settings.bios_path);
+        settings_changed |= DrawFileChooser("##bios_path", &m_settings_copy.bios_path);
 
-        settings_changed |= ImGui::Checkbox("Enable TTY Output", &m_settings.bios_patch_tty_enable);
-        settings_changed |= ImGui::Checkbox("Fast Boot", &m_settings.bios_patch_fast_boot);
+        settings_changed |= ImGui::Checkbox("Enable TTY Output", &m_settings_copy.bios_patch_tty_enable);
+        settings_changed |= ImGui::Checkbox("Fast Boot", &m_settings_copy.bios_patch_fast_boot);
       }
 
       ImGui::NewLine();
       if (DrawSettingsSectionHeader("Behavior"))
       {
-        if (ImGui::Checkbox("Enable Speed Limiter", &m_settings.speed_limiter_enabled))
-        {
-          settings_changed = true;
-          UpdateSpeedLimiterState();
-        }
+        ImGui::Text("Emulation Speed:");
+        ImGui::SameLine(indent);
 
-        settings_changed |= ImGui::Checkbox("Pause On Start", &m_settings.start_paused);
+        settings_changed |= ImGui::SliderFloat("##speed", &m_settings_copy.emulation_speed, 0.25f, 5.0f);
+        settings_changed |= ImGui::Checkbox("Enable Speed Limiter", &m_settings_copy.speed_limiter_enabled);
+        settings_changed |= ImGui::Checkbox("Increase Timer Resolution", &m_settings_copy.increase_timer_resolution);
+        settings_changed |= ImGui::Checkbox("Pause On Start", &m_settings_copy.start_paused);
+        settings_changed |= ImGui::Checkbox("Save State On Exit", &m_settings_copy.save_state_on_exit);
+      }
+
+      ImGui::NewLine();
+      if (DrawSettingsSectionHeader("CDROM Emulation"))
+      {
+        settings_changed |= ImGui::Checkbox("Use Read Thread (Asynchronous)", &m_settings.cdrom_read_thread);
       }
 
       ImGui::NewLine();
@@ -1182,7 +1120,7 @@ void SDLHostInterface::DrawSettingsWindow()
         ImGui::Text("Backend:");
         ImGui::SameLine(indent);
 
-        int backend = static_cast<int>(m_settings.audio_backend);
+        int backend = static_cast<int>(m_settings_copy.audio_backend);
         if (ImGui::Combo(
               "##backend", &backend,
               [](void*, int index, const char** out_text) {
@@ -1191,16 +1129,11 @@ void SDLHostInterface::DrawSettingsWindow()
               },
               nullptr, static_cast<int>(AudioBackend::Count)))
         {
-          m_settings.audio_backend = static_cast<AudioBackend>(backend);
+          m_settings_copy.audio_backend = static_cast<AudioBackend>(backend);
           settings_changed = true;
-          SwitchAudioBackend();
         }
 
-        if (ImGui::Checkbox("Output Sync", &m_settings.audio_sync_enabled))
-        {
-          settings_changed = true;
-          UpdateSpeedLimiterState();
-        }
+        settings_changed |= ImGui::Checkbox("Output Sync", &m_settings_copy.audio_sync_enabled);
       }
 
       ImGui::EndTabItem();
@@ -1218,7 +1151,7 @@ void SDLHostInterface::DrawSettingsWindow()
           ImGui::Text("Controller:");
           ImGui::SameLine(indent);
 
-          int controller_type = static_cast<int>(m_settings.controller_types[i]);
+          int controller_type = static_cast<int>(m_settings_copy.controller_types[i]);
           if (ImGui::Combo(
                 "##controller_type", &controller_type,
                 [](void*, int index, const char** out_text) {
@@ -1227,34 +1160,22 @@ void SDLHostInterface::DrawSettingsWindow()
                 },
                 nullptr, static_cast<int>(ControllerType::Count)))
           {
-            m_settings.controller_types[i] = static_cast<ControllerType>(controller_type);
+            m_settings_copy.controller_types[i] = static_cast<ControllerType>(controller_type);
             settings_changed = true;
-            if (m_system)
-            {
-              m_system->UpdateControllers();
-              UpdateControllerControllerMapping();
-            }
           }
         }
 
         ImGui::Text("Memory Card Path:");
         ImGui::SameLine(indent);
 
-        std::string* path_ptr = &m_settings.memory_card_paths[i];
+        std::string* path_ptr = &m_settings_copy.memory_card_paths[i];
         std::snprintf(buf, sizeof(buf), "##memcard_%c_path", 'a' + i);
-        if (DrawFileChooser(buf, path_ptr))
-        {
-          settings_changed = true;
-          if (m_system)
-            m_system->UpdateMemoryCards();
-        }
+        settings_changed |= DrawFileChooser(buf, path_ptr);
 
         if (ImGui::Button("Eject Memory Card"))
         {
           path_ptr->clear();
           settings_changed = true;
-          if (m_system)
-            m_system->UpdateMemoryCards();
         }
 
         ImGui::NewLine();
@@ -1268,7 +1189,7 @@ void SDLHostInterface::DrawSettingsWindow()
       ImGui::Text("Execution Mode:");
       ImGui::SameLine(indent);
 
-      int execution_mode = static_cast<int>(m_settings.cpu_execution_mode);
+      int execution_mode = static_cast<int>(m_settings_copy.cpu_execution_mode);
       if (ImGui::Combo(
             "##execution_mode", &execution_mode,
             [](void*, int index, const char** out_text) {
@@ -1277,10 +1198,8 @@ void SDLHostInterface::DrawSettingsWindow()
             },
             nullptr, static_cast<int>(CPUExecutionMode::Count)))
       {
-        m_settings.cpu_execution_mode = static_cast<CPUExecutionMode>(execution_mode);
+        m_settings_copy.cpu_execution_mode = static_cast<CPUExecutionMode>(execution_mode);
         settings_changed = true;
-        if (m_system)
-          m_system->SetCPUExecutionMode(m_settings.cpu_execution_mode);
       }
 
       ImGui::EndTabItem();
@@ -1293,7 +1212,7 @@ void SDLHostInterface::DrawSettingsWindow()
         ImGui::Text("Renderer:");
         ImGui::SameLine(indent);
 
-        int gpu_renderer = static_cast<int>(m_settings.gpu_renderer);
+        int gpu_renderer = static_cast<int>(m_settings_copy.gpu_renderer);
         if (ImGui::Combo(
               "##gpu_renderer", &gpu_renderer,
               [](void*, int index, const char** out_text) {
@@ -1302,9 +1221,8 @@ void SDLHostInterface::DrawSettingsWindow()
               },
               nullptr, static_cast<int>(GPURenderer::Count)))
         {
-          m_settings.gpu_renderer = static_cast<GPURenderer>(gpu_renderer);
+          m_settings_copy.gpu_renderer = static_cast<GPURenderer>(gpu_renderer);
           settings_changed = true;
-          QueueSwitchGPURenderer();
         }
       }
 
@@ -1312,23 +1230,28 @@ void SDLHostInterface::DrawSettingsWindow()
 
       if (DrawSettingsSectionHeader("Display Output"))
       {
-        if (ImGui::Checkbox("Fullscreen", &m_settings.display_fullscreen))
+        ImGui::Text("Crop:");
+        ImGui::SameLine(indent);
+
+        int display_crop_mode = static_cast<int>(m_settings_copy.display_crop_mode);
+        if (ImGui::Combo(
+              "##display_crop_mode", &display_crop_mode,
+              [](void*, int index, const char** out_text) {
+                *out_text = Settings::GetDisplayCropModeDisplayName(static_cast<DisplayCropMode>(index));
+                return true;
+              },
+              nullptr, static_cast<int>(DisplayCropMode::Count)))
         {
-          UpdateFullscreen();
+          m_settings_copy.display_crop_mode = static_cast<DisplayCropMode>(display_crop_mode);
           settings_changed = true;
         }
 
-        if (ImGui::Checkbox("Linear Filtering", &m_settings.display_linear_filtering))
-        {
-          m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
+        if (ImGui::Checkbox("Start Fullscreen", &m_settings_copy.display_fullscreen))
           settings_changed = true;
-        }
 
-        if (ImGui::Checkbox("VSync", &m_settings.video_sync_enabled))
-        {
-          settings_changed = true;
-          UpdateSpeedLimiterState();
-        }
+        settings_changed |= ImGui::Checkbox("Use Debug Device", &m_settings_copy.gpu_use_debug_device);
+        settings_changed |= ImGui::Checkbox("Linear Filtering", &m_settings_copy.display_linear_filtering);
+        settings_changed |= ImGui::Checkbox("VSync", &m_settings_copy.video_sync_enabled);
       }
 
       ImGui::NewLine();
@@ -1338,7 +1261,7 @@ void SDLHostInterface::DrawSettingsWindow()
         ImGui::Text("Resolution Scale:");
         ImGui::SameLine(indent);
 
-        static constexpr std::array<const char*, 16> resolutions = {{
+        static constexpr std::array<const char*, GPU::MAX_RESOLUTION_SCALE> resolutions = {{
           "1x (1024x512)",
           "2x (2048x1024)",
           "3x (3072x1536)",
@@ -1357,17 +1280,17 @@ void SDLHostInterface::DrawSettingsWindow()
           "16x (16384x8192)",
         }};
 
-        int current_resolution_index = static_cast<int>(m_settings.gpu_resolution_scale) - 1;
+        int current_resolution_index = static_cast<int>(m_settings_copy.gpu_resolution_scale) - 1;
         if (ImGui::Combo("##gpu_resolution_scale", &current_resolution_index, resolutions.data(),
                          static_cast<int>(resolutions.size())))
         {
-          m_settings.gpu_resolution_scale = static_cast<u32>(current_resolution_index + 1);
-          gpu_settings_changed = true;
+          m_settings_copy.gpu_resolution_scale = static_cast<u32>(current_resolution_index + 1);
+          settings_changed = true;
         }
 
-        gpu_settings_changed |= ImGui::Checkbox("True 24-bit Color (disables dithering)", &m_settings.gpu_true_color);
-        gpu_settings_changed |= ImGui::Checkbox("Texture Filtering", &m_settings.gpu_texture_filtering);
-        gpu_settings_changed |= ImGui::Checkbox("Force Progressive Scan", &m_settings.gpu_force_progressive_scan);
+        settings_changed |= ImGui::Checkbox("True 24-bit Color (disables dithering)", &m_settings_copy.gpu_true_color);
+        settings_changed |= ImGui::Checkbox("Texture Filtering", &m_settings_copy.gpu_texture_filtering);
+        settings_changed |= ImGui::Checkbox("Force Progressive Scan", &m_settings_copy.display_force_progressive_scan);
       }
 
       ImGui::EndTabItem();
@@ -1376,23 +1299,21 @@ void SDLHostInterface::DrawSettingsWindow()
     ImGui::EndTabBar();
   }
 
-  const auto window_size = ImGui::GetWindowSize();
-  ImGui::SetCursorPosX(window_size.x - 50.0f);
-  ImGui::SetCursorPosY(window_size.y - 30.0f);
-  if (ImGui::Button("Close"))
-    m_settings_window_open = false;
-
   ImGui::End();
 
-  if (settings_changed || gpu_settings_changed)
-    SaveSettings();
-
-  if (gpu_settings_changed && m_system)
-    m_system->GetGPU()->UpdateSettings();
+  if (settings_changed)
+  {
+    RunLater([this]() {
+      SaveSettings();
+      UpdateSettings();
+    });
+  }
 }
 
 void SDLHostInterface::DrawAboutWindow()
 {
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
   ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f),
                           ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
@@ -1414,8 +1335,8 @@ void SDLHostInterface::DrawAboutWindow()
 
   ImGui::NewLine();
 
-  ImGui::SetCursorPosX((ImGui::GetWindowSize().x - 60.0f) / 2.0f);
-  if (ImGui::Button("Close", ImVec2(60.0f, 20.0f)))
+  ImGui::SetCursorPosX((ImGui::GetWindowSize().x - (60.0f * framebuffer_scale)) / 2.0f);
+  if (ImGui::Button("Close", ImVec2(60.0f * framebuffer_scale, 20.0f * framebuffer_scale)))
     m_about_window_open = false;
 
   ImGui::EndPopup();
@@ -1423,11 +1344,13 @@ void SDLHostInterface::DrawAboutWindow()
 
 bool SDLHostInterface::DrawFileChooser(const char* label, std::string* path, const char* filter /* = nullptr */)
 {
-  ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - 50.0f);
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
+  ImGui::SetNextItemWidth((ImGui::CalcItemWidth() - 50.0f) * framebuffer_scale);
   bool result = ImGui::InputText(label, path);
   ImGui::SameLine();
 
-  ImGui::SetNextItemWidth(50.0f);
+  ImGui::SetNextItemWidth(50.0f * framebuffer_scale);
   if (ImGui::Button("..."))
   {
     nfdchar_t* out_path = nullptr;
@@ -1441,25 +1364,9 @@ bool SDLHostInterface::DrawFileChooser(const char* label, std::string* path, con
   return result;
 }
 
-void SDLHostInterface::DoPowerOff()
+void SDLHostInterface::ClearImGuiFocus()
 {
-  Assert(m_system);
-  DestroySystem();
-  AddOSDMessage("System powered off.");
-}
-
-void SDLHostInterface::DoResume()
-{
-  Assert(!m_system);
-  if (!CreateSystem() || !BootSystem(nullptr, RESUME_SAVESTATE_FILENAME))
-  {
-    DestroySystem();
-    return;
-  }
-
-  UpdateControllerMapping();
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
+  ImGui::SetWindowFocus(nullptr);
 }
 
 void SDLHostInterface::DoStartDisc()
@@ -1471,31 +1378,10 @@ void SDLHostInterface::DoStartDisc()
     return;
 
   AddFormattedOSDMessage(2.0f, "Starting disc from '%s'...", path);
-  if (!CreateSystem() || !BootSystem(path, nullptr))
-  {
-    DestroySystem();
-    return;
-  }
 
-  UpdateControllerMapping();
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
-}
-
-void SDLHostInterface::DoStartBIOS()
-{
-  Assert(!m_system);
-
-  AddOSDMessage("Starting BIOS...");
-  if (!CreateSystem() || !BootSystem(nullptr, nullptr))
-  {
-    DestroySystem();
-    return;
-  }
-
-  UpdateControllerMapping();
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
+  SystemBootParameters boot_params;
+  boot_params.filename = path;
+  BootSystem(boot_params);
 }
 
 void SDLHostInterface::DoChangeDisc()
@@ -1511,45 +1397,7 @@ void SDLHostInterface::DoChangeDisc()
   else
     AddOSDMessage("Failed to switch CD. The log may contain further information.");
 
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
-}
-
-void SDLHostInterface::DoLoadState(u32 index)
-{
-  if (HasSystem())
-  {
-    LoadState(GetSaveStateFilename(index).c_str());
-  }
-  else
-  {
-    if (!CreateSystem() || !BootSystem(nullptr, GetSaveStateFilename(index).c_str()))
-    {
-      DestroySystem();
-      return;
-    }
-  }
-
-  UpdateControllerMapping();
-  ResetPerformanceCounters();
-  ClearImGuiFocus();
-}
-
-void SDLHostInterface::DoSaveState(u32 index)
-{
-  Assert(m_system);
-  SaveState(GetSaveStateFilename(index).c_str());
-  ClearImGuiFocus();
-}
-
-void SDLHostInterface::DoTogglePause()
-{
-  if (!m_system)
-    return;
-
-  m_paused = !m_paused;
-  if (!m_paused)
-    m_fps_timer.Reset();
+  m_system->ResetPerformanceCounters();
 }
 
 void SDLHostInterface::DoFrameStep()
@@ -1561,16 +1409,8 @@ void SDLHostInterface::DoFrameStep()
   m_paused = false;
 }
 
-void SDLHostInterface::DoToggleFullscreen()
-{
-  m_settings.display_fullscreen = !m_settings.display_fullscreen;
-  UpdateFullscreen();
-}
-
 void SDLHostInterface::Run()
 {
-  m_audio_stream->PauseOutput(false);
-
   while (!m_quit_request)
   {
     for (;;)
@@ -1584,7 +1424,7 @@ void SDLHostInterface::Run()
 
     if (m_system && !m_paused)
     {
-      RunFrame();
+      m_system->RunFrame();
       if (m_frame_step_request)
       {
         m_frame_step_request = false;
@@ -1592,7 +1432,7 @@ void SDLHostInterface::Run()
       }
     }
 
-    UpdateControllerRumble();
+    g_sdl_controller_interface.UpdateControllerRumble();
 
     // rendering
     {
@@ -1601,17 +1441,14 @@ void SDLHostInterface::Run()
       if (m_system)
         m_system->GetGPU()->ResetGraphicsAPIState();
 
-      ImGui::Render();
       m_display->Render();
-
-      ImGui::NewFrame();
 
       if (m_system)
       {
         m_system->GetGPU()->RestoreGraphicsAPIState();
 
         if (m_speed_limiter_enabled)
-          Throttle();
+          m_system->Throttle();
       }
     }
   }
@@ -1619,9 +1456,8 @@ void SDLHostInterface::Run()
   // Save state on exit so it can be resumed
   if (m_system)
   {
-    if (!SaveState(RESUME_SAVESTATE_FILENAME))
-      ReportError("Saving state failed, you will not be able to resume this session.");
-
+    if (m_settings.save_state_on_exit)
+      SaveResumeSaveState();
     DestroySystem();
   }
 }

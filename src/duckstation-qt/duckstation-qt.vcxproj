@@ -88,6 +88,9 @@
     <ProjectReference Include="..\core\core.vcxproj">
       <Project>{868b98c8-65a1-494b-8346-250a73a48c0a}</Project>
     </ProjectReference>
+    <ProjectReference Include="..\frontend-common\frontend-common.vcxproj">
+      <Project>{6245dec8-d2da-47ee-a373-cbd6fcf3ece6}</Project>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <QtUi Include="audiosettingswidget.ui">
@@ -380,6 +383,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(SolutionDir)dep\msvc\lib32;$(SolutionDir)dep\msvc\qt5-x86\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Qt5Core.lib;Qt5Gui.lib;Qt5Widgets.lib;Qt5Network.lib;d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseLTCG|Win32'">
@@ -426,6 +430,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(SolutionDir)dep\msvc\lib64;$(SolutionDir)dep\msvc\qt5-x64\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Qt5Core.lib;Qt5Gui.lib;Qt5Widgets.lib;Qt5Network.lib;d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseLTCG|x64'">

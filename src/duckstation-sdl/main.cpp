@@ -1,47 +1,60 @@
 #include "common/assert.h"
 #include "common/log.h"
 #include "core/system.h"
+#include "frontend-common/sdl_initializer.h"
 #include "sdl_host_interface.h"
 #include <SDL.h>
 #include <cstdio>
 
 static int Run(int argc, char* argv[])
 {
-  // init sdl
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
-  {
-    Panic("SDL initialization failed");
-    return -1;
-  }
-
   // parameters
-  const char* filename = nullptr;
-  const char* exp1_filename = nullptr;
-  std::string state_filename;
+  std::optional<s32> state_index;
+  bool state_is_global = false;
+  const char* boot_filename = nullptr;
   for (int i = 1; i < argc; i++)
   {
 #define CHECK_ARG(str) !std::strcmp(argv[i], str)
 #define CHECK_ARG_PARAM(str) (!std::strcmp(argv[i], str) && ((i + 1) < argc))
 
-    if (CHECK_ARG_PARAM("-state"))
-      state_filename = SDLHostInterface::GetSaveStateFilename(std::strtoul(argv[++i], nullptr, 10));
-    else if (CHECK_ARG_PARAM("-exp1"))
-      exp1_filename = argv[++i];
+    if (CHECK_ARG_PARAM("-state") || CHECK_ARG_PARAM("-gstate"))
+    {
+      state_is_global = argv[i][1] == 'g';
+      state_index = std::atoi(argv[++i]);
+    }
+    else if (CHECK_ARG_PARAM("-resume"))
+    {
+      state_index = -1;
+    }
     else
-      filename = argv[i];
+    {
+      boot_filename = argv[i];
+    }
 
 #undef CHECK_ARG
 #undef CHECK_ARG_PARAM
   }
 
   // create display and host interface
-  std::unique_ptr<SDLHostInterface> host_interface =
-    SDLHostInterface::Create(filename, exp1_filename, state_filename.empty() ? nullptr : state_filename.c_str());
+  std::unique_ptr<SDLHostInterface> host_interface = SDLHostInterface::Create();
   if (!host_interface)
   {
     Panic("Failed to create host interface");
     SDL_Quit();
     return -1;
+  }
+
+  // boot/load state
+  if (boot_filename)
+  {
+    SystemBootParameters boot_params;
+    boot_params.filename = boot_filename;
+    if (host_interface->BootSystem(boot_params) && state_index.has_value())
+      host_interface->LoadState(state_is_global, state_index.value());
+  }
+  else if (state_index.has_value())
+  {
+    host_interface->LoadState(true, state_index.value());
   }
 
   // run
@@ -66,12 +79,15 @@ int main(int argc, char* argv[])
   Log::SetFilterLevel(level);
 #else
   Log::SetConsoleOutputParams(true, nullptr, LOGLEVEL_DEBUG);
+  Log::SetConsoleOutputParams(true, "Pad DigitalController MemoryCard SPU", LOGLEVEL_DEBUG);
   // Log::SetConsoleOutputParams(true, "GPU GPU_HW_OpenGL SPU Pad DigitalController", LOGLEVEL_DEBUG);
   // Log::SetConsoleOutputParams(true, "GPU GPU_HW_OpenGL Pad DigitalController MemoryCard InterruptController SPU
   // MDEC", LOGLEVEL_DEBUG); g_pLog->SetFilterLevel(LOGLEVEL_TRACE);
   Log::SetFilterLevel(LOGLEVEL_DEBUG);
   // Log::SetFilterLevel(LOGLEVEL_DEV);
 #endif
+
+  FrontendCommon::EnsureSDLInitialized();
 
   // return NoGUITest();
   return Run(argc, argv);

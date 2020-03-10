@@ -11,6 +11,11 @@ QtSettingsInterface::QtSettingsInterface(QSettings& settings) : m_settings(setti
 
 QtSettingsInterface::~QtSettingsInterface() = default;
 
+void QtSettingsInterface::Clear()
+{
+  m_settings.clear();
+}
+
 int QtSettingsInterface::GetIntValue(const char* section, const char* key, int default_value /*= 0*/)
 {
   QVariant value = m_settings.value(GetFullKey(section, key));
@@ -59,7 +64,7 @@ void QtSettingsInterface::SetIntValue(const char* section, const char* key, int 
 
 void QtSettingsInterface::SetFloatValue(const char* section, const char* key, float value)
 {
-  m_settings.setValue(GetFullKey(section, key), QVariant(value));
+  m_settings.setValue(GetFullKey(section, key), QString::number(value));
 }
 
 void QtSettingsInterface::SetBoolValue(const char* section, const char* key, bool value)
@@ -76,7 +81,7 @@ std::vector<std::string> QtSettingsInterface::GetStringList(const char* section,
 {
   QVariant value = m_settings.value(GetFullKey(section, key));
   if (value.type() == QVariant::String)
-    return { value.toString().toStdString() };
+    return {value.toString().toStdString()};
   else if (value.type() != QVariant::StringList)
     return {};
 

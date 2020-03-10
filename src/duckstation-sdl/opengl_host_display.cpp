@@ -1,10 +1,10 @@
 #include "opengl_host_display.h"
 #include "common/assert.h"
 #include "common/log.h"
+#include "imgui_impl_sdl.h"
 #include <array>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
-#include "imgui_impl_sdl.h"
 #include <tuple>
 Log_SetChannel(OpenGLHostDisplay);
 
@@ -100,6 +100,14 @@ void OpenGLHostDisplay::ChangeRenderWindow(void* new_window)
   Panic("Not implemented");
 }
 
+void OpenGLHostDisplay::WindowResized(s32 new_window_width, s32 new_window_height)
+{
+  HostDisplay::WindowResized(new_window_width, new_window_height);
+  SDL_GL_GetDrawableSize(m_window, &m_window_width, &m_window_height);
+  ImGui::GetIO().DisplaySize.x = static_cast<float>(m_window_width);
+  ImGui::GetIO().DisplaySize.y = static_cast<float>(m_window_height);
+}
+
 std::unique_ptr<HostDisplayTexture> OpenGLHostDisplay::CreateTexture(u32 width, u32 height, const void* data,
                                                                      u32 data_stride, bool dynamic)
 {
@@ -131,19 +139,22 @@ void OpenGLHostDisplay::SetVSync(bool enabled)
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, current_fbo);
 }
 
-std::tuple<u32, u32> OpenGLHostDisplay::GetWindowSize() const
-{
-  return std::make_tuple(static_cast<u32>(m_window_width), static_cast<u32>(m_window_height));
-}
-
-void OpenGLHostDisplay::WindowResized()
-{
-  SDL_GetWindowSize(m_window, &m_window_width, &m_window_height);
-}
-
 const char* OpenGLHostDisplay::GetGLSLVersionString() const
 {
-  return m_is_gles ? "#version 300 es" : "#version 130\n";
+  if (m_is_gles)
+  {
+    if (GLAD_GL_ES_VERSION_3_0)
+      return "#version 300 es";
+    else
+      return "#version 100";
+  }
+  else
+  {
+    if (GLAD_GL_VERSION_3_3)
+      return "#version 330";
+    else
+      return "#version 130";
+  }
 }
 
 std::string OpenGLHostDisplay::GetGLSLVersionHeader() const
@@ -249,11 +260,19 @@ bool OpenGLHostDisplay::CreateGLContext(bool debug_device)
     glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
   }
 
+  // this can change due to retina scaling on macos?
+  SDL_GL_GetDrawableSize(m_window, &m_window_width, &m_window_height);
+
+  // start with vsync on
+  SDL_GL_SetSwapInterval(1);
   return true;
 }
 
 bool OpenGLHostDisplay::CreateImGuiContext()
 {
+  ImGui::GetIO().DisplaySize.x = static_cast<float>(m_window_width);
+  ImGui::GetIO().DisplaySize.y = static_cast<float>(m_window_height);
+
   if (!ImGui_ImplSDL2_InitForOpenGL(m_window, m_gl_context) || !ImGui_ImplOpenGL3_Init(GetGLSLVersionString()))
     return false;
 
@@ -340,10 +359,12 @@ void OpenGLHostDisplay::Render()
 
   RenderDisplay();
 
+  ImGui::Render();
   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
   SDL_GL_SwapWindow(m_window);
 
+  ImGui::NewFrame();
   ImGui_ImplSDL2_NewFrame(m_window);
   ImGui_ImplOpenGL3_NewFrame();
 
@@ -355,21 +376,20 @@ void OpenGLHostDisplay::RenderDisplay()
   if (!m_display_texture_handle)
     return;
 
-  // - 20 for main menu padding
-  const auto [vp_left, vp_top, vp_width, vp_height] =
-    CalculateDrawRect(m_window_width, std::max(m_window_height - m_display_top_margin, 1), m_display_aspect_ratio);
+  const auto [vp_left, vp_top, vp_width, vp_height] = CalculateDrawRect();
 
-  glViewport(vp_left, m_window_height - (m_display_top_margin + vp_top) - vp_height, vp_width, vp_height);
+  glViewport(vp_left, m_window_height - vp_top - vp_height, vp_width, vp_height);
   glDisable(GL_BLEND);
   glDisable(GL_CULL_FACE);
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_SCISSOR_TEST);
   glDepthMask(GL_FALSE);
   m_display_program.Bind();
-  m_display_program.Uniform4f(0, static_cast<float>(m_display_offset_x) / static_cast<float>(m_display_texture_width),
-                              static_cast<float>(m_display_offset_y) / static_cast<float>(m_display_texture_height),
-                              static_cast<float>(m_display_width) / static_cast<float>(m_display_texture_width),
-                              static_cast<float>(m_display_height) / static_cast<float>(m_display_texture_height));
+  m_display_program.Uniform4f(
+    0, (static_cast<float>(m_display_texture_view_x) + 0.25f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_y) - 0.25f) / static_cast<float>(m_display_texture_height),
+    (static_cast<float>(m_display_texture_view_width) - 0.5f) / static_cast<float>(m_display_texture_width),
+    (static_cast<float>(m_display_texture_view_height) + 0.5f) / static_cast<float>(m_display_texture_height));
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(reinterpret_cast<uintptr_t>(m_display_texture_handle)));
   glBindSampler(0, m_display_linear_filtering ? m_display_linear_sampler : m_display_nearest_sampler);
   glBindVertexArray(m_display_vao);

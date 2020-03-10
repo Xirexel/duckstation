@@ -93,7 +93,8 @@ public:
     MAX_PRIMITIVE_WIDTH = 1024,
     MAX_PRIMITIVE_HEIGHT = 512,
     DOT_TIMER_INDEX = 0,
-    HBLANK_TIMER_INDEX = 1
+    HBLANK_TIMER_INDEX = 1,
+    MAX_RESOLUTION_SCALE = 16
   };
 
   // 4x4 dither matrix.
@@ -208,7 +209,10 @@ protected:
     BitField<u32, bool, 28, 1> shading_enable;              // 0 - flat, 1 = gouroud
     BitField<u32, Primitive, 29, 21> primitive;
 
-    // Returns true if dithering should be enabled. Depends on the primitive type.
+    /// Returns true if texturing should be enabled. Depends on the primitive type.
+    bool IsTexturingEnabled() const { return (primitive != Primitive::Line) ? texture_enable : false; }
+
+    /// Returns true if dithering should be enabled. Depends on the primitive type.
     bool IsDitheringEnabled() const
     {
       switch (primitive)
@@ -298,10 +302,16 @@ protected:
   void UpdateSliceTicks();
 
   // Updates dynamic bits in GPUSTAT (ready to send VRAM/ready to receive DMA)
-  void UpdateGPUSTAT();
+  void UpdateDMARequest();
 
   // Ticks for hblank/vblank.
   void Execute(TickCount ticks);
+
+  /// Returns the number of pending GPU ticks.
+  TickCount GetPendingGPUTicks() const;
+
+  /// Returns true if enough ticks have passed for the raster to be on the next line.
+  bool IsRasterScanlinePending() const;
 
   /// Returns true if scanout should be interlaced.
   bool IsDisplayInterlaced() const { return !m_force_progressive_scan && m_GPUSTAT.In480iMode(); }
@@ -369,12 +379,28 @@ protected:
     BitField<u32, DMADirection, 29, 2> dma_direction;
     BitField<u32, bool, 31, 1> drawing_even_line;
 
-    bool IsMaskingEnabled() const { return (bits & ((1 << 11) | (1 << 12))) != 0; }
-    bool In480iMode() const { return (bits & ((1 << 22) | (1 << 19))) != 0; }
+    bool IsMaskingEnabled() const
+    {
+      static constexpr u32 MASK = ((1 << 11) | (1 << 12));
+      return ((bits & MASK) != 0);
+    }
+    bool In480iMode() const
+    {
+      static constexpr u32 MASK = (1 << 19) | (1 << 22);
+      return ((bits & MASK) == MASK);
+    }
 
-    // During transfer/render operations, if ((dst_pixel & mask_and) == mask_and) { pixel = src_pixel | mask_or }
-    u16 GetMaskAND() const { return check_mask_before_draw ? 0x8000 : 0x0000; }
-    u16 GetMaskOR() const { return set_mask_while_drawing ? 0x8000 : 0x0000; }
+    // During transfer/render operations, if ((dst_pixel & mask_and) == 0) { pixel = src_pixel | mask_or }
+    u16 GetMaskAND() const
+    {
+      // return check_mask_before_draw ? 0x8000 : 0x0000;
+      return Truncate16((bits << 3) & 0x8000);
+    }
+    u16 GetMaskOR() const
+    {
+      // return set_mask_while_drawing ? 0x8000 : 0x0000;
+      return Truncate16((bits << 4) & 0x8000);
+    }
   } m_GPUSTAT = {};
 
   struct DrawMode
@@ -392,7 +418,7 @@ protected:
       static constexpr u16 POLYGON_TEXPAGE_MASK = 0b0000100111111111;
 
       // Bits 0..5 are returned in the GPU status register, latched at E1h/polygon draw time.
-      static constexpr u32 GPUSTAT_MASK = 0b111111111111;
+      static constexpr u32 GPUSTAT_MASK = 0b11111111111;
 
       u16 bits;
 
@@ -436,16 +462,15 @@ protected:
     TransparencyMode GetTransparencyMode() const { return mode_reg.transparency_mode; }
 
     /// Returns true if the texture mode requires a palette.
-    bool IsUsingPalette() const
-    {
-      return (static_cast<u8>(mode_reg.texture_mode.GetValue()) &
-              (static_cast<u8>(TextureMode::Palette4Bit) | static_cast<u8>(TextureMode::Palette8Bit))) != 0;
-    }
+    bool IsUsingPalette() const { return (mode_reg.bits & (2 << 7)) == 0; }
 
     /// Returns a rectangle comprising the texture page area.
     Common::Rectangle<u32> GetTexturePageRectangle() const
     {
-      return Common::Rectangle<u32>::FromExtents(texture_page_x, texture_page_y, TEXTURE_PAGE_WIDTH,
+      static constexpr std::array<u32, 4> texture_page_widths = {
+        {TEXTURE_PAGE_WIDTH / 4, TEXTURE_PAGE_WIDTH / 2, TEXTURE_PAGE_WIDTH, TEXTURE_PAGE_WIDTH}};
+      return Common::Rectangle<u32>::FromExtents(texture_page_x, texture_page_y,
+                                                 texture_page_widths[static_cast<u8>(mode_reg.texture_mode.GetValue())],
                                                  TEXTURE_PAGE_HEIGHT);
     }
 
@@ -453,8 +478,8 @@ protected:
     Common::Rectangle<u32> GetTexturePaletteRectangle() const
     {
       static constexpr std::array<u32, 4> palette_widths = {{16, 256, 0, 0}};
-      return Common::Rectangle<u32>::FromExtents(
-        texture_palette_x, texture_palette_y, palette_widths[static_cast<u8>(mode_reg.texture_mode.GetValue()) & 3], 1);
+      return Common::Rectangle<u32>::FromExtents(texture_palette_x, texture_palette_y,
+                                                 palette_widths[static_cast<u8>(mode_reg.texture_mode.GetValue())], 1);
     }
 
     bool IsTexturePageChanged() const { return texture_page_changed; }
@@ -493,28 +518,32 @@ protected:
       union
       {
         u32 display_address_start;
-        BitField<u32, u32, 0, 10> X;
-        BitField<u32, u32, 10, 9> Y;
+        BitField<u32, u16, 0, 10> X;
+        BitField<u32, u16, 10, 9> Y;
       };
       union
       {
         u32 horizontal_display_range;
-        BitField<u32, u32, 0, 12> X1;
-        BitField<u32, u32, 12, 12> X2;
+        BitField<u32, u16, 0, 12> X1;
+        BitField<u32, u16, 12, 12> X2;
       };
 
       union
       {
         u32 vertical_display_range;
-        BitField<u32, u32, 0, 10> Y1;
-        BitField<u32, u32, 10, 10> Y2;
+        BitField<u32, u16, 0, 10> Y1;
+        BitField<u32, u16, 10, 10> Y2;
       };
     } regs;
 
-    TickCount dot_clock_divider;
+    u16 dot_clock_divider;
 
-    u32 display_width;
-    u32 display_height;
+    u16 visible_display_width;
+    u16 visible_display_height;
+    u16 active_display_left;
+    u16 active_display_top;
+    u16 active_display_width;
+    u16 active_display_height;
 
     TickCount horizontal_total;
     TickCount horizontal_display_start;
@@ -530,10 +559,24 @@ protected:
     float display_aspect_ratio;
     bool in_hblank;
     bool in_vblank;
+
+    /// Returns a rectangle representing the active display region within the visible area of the screen, i.e. where the
+    /// VRAM texture should be "scanned out" to. Areas outside this region (the border) should be displayed as black.
+    Common::Rectangle<s32> GetActiveDisplayRectangle() const
+    {
+      return Common::Rectangle<s32>::FromExtents(
+        static_cast<s32>(ZeroExtend32(active_display_left)), static_cast<s32>(ZeroExtend32(active_display_top)),
+        static_cast<s32>(ZeroExtend32(active_display_width)), static_cast<s32>(ZeroExtend32(active_display_height)));
+    }
   } m_crtc_state = {};
 
   State m_state = State::Idle;
+  TickCount m_blitter_ticks = 0;
   u32 m_command_total_words = 0;
+
+  /// GPUREAD value for non-VRAM-reads.
+  u32 m_GPUREAD_latch = 0;
+
   struct VRAMTransfer
   {
     u16 x;
@@ -543,9 +586,6 @@ protected:
     u16 col;
     u16 row;
   } m_vram_transfer = {};
-
-  /// GPUREAD value for non-VRAM-reads.
-  u32 m_GPUREAD_latch = 0;
 
   std::vector<u32> m_GP0_buffer;
 

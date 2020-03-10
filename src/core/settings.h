@@ -9,6 +9,8 @@
 class SettingsInterface
 {
 public:
+  virtual void Clear() = 0;
+
   virtual int GetIntValue(const char* section, const char* key, int default_value = 0) = 0;
   virtual float GetFloatValue(const char* section, const char* key, float default_value = 0.0f) = 0;
   virtual bool GetBoolValue(const char* section, const char* key, bool default_value = false) = 0;
@@ -35,21 +37,28 @@ struct Settings
 
   CPUExecutionMode cpu_execution_mode = CPUExecutionMode::Interpreter;
 
-  bool start_paused = false;
+  float emulation_speed = 1.0f;
   bool speed_limiter_enabled = true;
+  bool increase_timer_resolution = true;
+  bool start_paused = false;
+  bool save_state_on_exit = true;
+  bool confim_power_off = true;
 
   GPURenderer gpu_renderer = GPURenderer::Software;
   u32 gpu_resolution_scale = 1;
-  mutable u32 max_gpu_resolution_scale = 1;
-  bool gpu_true_color = false;
+  bool gpu_true_color = true;
+  bool gpu_scaled_dithering = false;
   bool gpu_texture_filtering = false;
-  bool gpu_force_progressive_scan = false;
   bool gpu_use_debug_device = false;
+  DisplayCropMode display_crop_mode = DisplayCropMode::None;
+  bool display_force_progressive_scan = false;
   bool display_linear_filtering = true;
   bool display_fullscreen = false;
   bool video_sync_enabled = true;
 
-  AudioBackend audio_backend = AudioBackend::Default;
+  bool cdrom_read_thread = true;
+
+  AudioBackend audio_backend = AudioBackend::Cubeb;
   bool audio_sync_enabled = true;
 
   struct DebugSettings
@@ -90,6 +99,10 @@ struct Settings
   static const char* GetRendererName(GPURenderer renderer);
   static const char* GetRendererDisplayName(GPURenderer renderer);
 
+  static std::optional<DisplayCropMode> ParseDisplayCropMode(const char* str);
+  static const char* GetDisplayCropModeName(DisplayCropMode crop_mode);
+  static const char* GetDisplayCropModeDisplayName(DisplayCropMode crop_mode);
+
   static std::optional<AudioBackend> ParseAudioBackend(const char* str);
   static const char* GetAudioBackendName(AudioBackend backend);
   static const char* GetAudioBackendDisplayName(AudioBackend backend);
@@ -97,4 +110,11 @@ struct Settings
   static std::optional<ControllerType> ParseControllerTypeName(const char* str);
   static const char* GetControllerTypeName(ControllerType type);
   static const char* GetControllerTypeDisplayName(ControllerType type);
+
+  // Default to D3D11 on Windows as it's more performant and at this point, less buggy.
+#ifdef WIN32
+  static constexpr GPURenderer DEFAULT_GPU_RENDERER = GPURenderer::HardwareD3D11;
+#else
+  static constexpr GPURenderer DEFAULT_GPU_RENDERER = GPURenderer::HardwareOpenGL;
+#endif
 };

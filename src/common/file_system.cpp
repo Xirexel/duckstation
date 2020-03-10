@@ -5,8 +5,14 @@
 #include "string_util.h"
 #include <algorithm>
 #include <cstring>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <stdlib.h>
+#include <sys/param.h>
+#else
 #include <malloc.h>
-Log_SetChannel(FileSystem);
+#endif
 
 #if defined(WIN32)
 #include <shlobj.h>
@@ -17,6 +23,8 @@ Log_SetChannel(FileSystem);
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+
+Log_SetChannel(FileSystem);
 
 namespace FileSystem {
 
@@ -891,15 +899,13 @@ bool FileSystem::CreateDirectory(const char* Path, bool Recursive)
     // create directories along the path
     for (i = 0; i < pathLength; i++)
     {
-      if (Path[i] == '\\')
+      if (Path[i] == '\\' || Path[i] == '/')
       {
         tempStr[i] = '\0';
         if (!CreateDirectoryA(tempStr, nullptr))
         {
           lastError = GetLastError();
-          if (lastError == ERROR_ALREADY_EXISTS) // fine, continue to next path segment
-            continue;
-          else // anything else is a fail
+          if (lastError != ERROR_ALREADY_EXISTS) // fine, continue to next path segment
             return false;
         }
       }
@@ -1310,9 +1316,7 @@ bool CreateDirectory(const char* Path, bool Recursive)
         if (mkdir(tempStr, 0777) < 0)
         {
           lastError = errno;
-          if (lastError == EEXIST) // fine, continue to next path segment
-            continue;
-          else // anything else is a fail
+          if (lastError != EEXIST) // fine, continue to next path segment
             return false;
         }
       }
@@ -1389,10 +1393,10 @@ std::string GetProgramPath()
 #elif defined(__APPLE__)
 
   int curSize = PATH_MAX;
-  char* buffer = static_cast<char*>(std::realloc(nullptr, curSize + 1));
+  char* buffer = static_cast<char*>(std::realloc(nullptr, curSize));
   for (;;)
   {
-    uint32 nChars = PATH_MAX - 1;
+    u32 nChars = curSize - 1;
     int res = _NSGetExecutablePath(buffer, &nChars);
     if (res == 0)
     {
@@ -1405,15 +1409,9 @@ std::string GetProgramPath()
         return {};
       }
 
-      std::string ret(buffer, len);
+      std::string ret(buffer);
       std::free(buffer);
       return ret;
-    }
-
-    if (curSize >= 1048576)
-    {
-      std::free(buffer);
-      return {};
     }
 
     curSize *= 2;

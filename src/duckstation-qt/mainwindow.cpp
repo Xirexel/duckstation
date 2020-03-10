@@ -1,12 +1,16 @@
 #include "mainwindow.h"
+#include "common/assert.h"
 #include "core/game_list.h"
 #include "core/settings.h"
+#include "core/system.h"
 #include "gamelistsettingswidget.h"
 #include "gamelistwidget.h"
+#include "qtdisplaywindow.h"
 #include "qthostinterface.h"
 #include "qtsettingsinterface.h"
 #include "settingsdialog.h"
 #include "settingwidgetbinder.h"
+#include <QtCore/QFileInfo>
 #include <QtCore/QUrl>
 #include <QtGui/QDesktopServices>
 #include <QtWidgets/QFileDialog>
@@ -14,7 +18,7 @@
 #include <cmath>
 
 static constexpr char DISC_IMAGE_FILTER[] =
-  "All File Types (*.bin *.img *.cue *.exe *.psexe);;Single-Track Raw Images (*.bin *.img);;Cue Sheets "
+  "All File Types (*.bin *.img *.cue *.chd *.exe *.psexe);;Single-Track Raw Images (*.bin *.img);;Cue Sheets "
   "(*.cue);;MAME CHD Images (*.chd);;PlayStation Executables (*.exe *.psexe)";
 
 MainWindow::MainWindow(QtHostInterface* host_interface) : QMainWindow(nullptr), m_host_interface(host_interface)
@@ -22,34 +26,101 @@ MainWindow::MainWindow(QtHostInterface* host_interface) : QMainWindow(nullptr), 
   m_ui.setupUi(this);
   setupAdditionalUi();
   connectSignals();
-  populateLoadSaveStateMenus(QString());
 
   resize(750, 690);
 }
 
 MainWindow::~MainWindow()
 {
-  delete m_display_widget;
-  m_host_interface->displayWidgetDestroyed();
+  Assert(!m_display_widget);
 }
 
-void MainWindow::reportError(QString message)
+void MainWindow::reportError(const QString& message)
 {
-  QMessageBox::critical(nullptr, tr("DuckStation Error"), message, QMessageBox::Ok);
+  QMessageBox::critical(this, tr("DuckStation"), message, QMessageBox::Ok);
 }
 
-void MainWindow::reportMessage(QString message)
+void MainWindow::reportMessage(const QString& message)
 {
   m_ui.statusBar->showMessage(message, 2000);
 }
 
-void MainWindow::onEmulationStarting()
+bool MainWindow::confirmMessage(const QString& message)
 {
-  switchToEmulationView();
-  updateEmulationActions(true, false);
+  const int result = QMessageBox::question(this, tr("DuckStation"), message);
+  focusDisplayWidget();
 
-  // we need the surface visible..
+  return (result == QMessageBox::Yes);
+}
+
+void MainWindow::createDisplayWindow(QThread* worker_thread, bool use_debug_device)
+{
+  DebugAssert(!m_display_widget);
+
+  QtDisplayWindow* display_window = m_host_interface->createDisplayWindow();
+  DebugAssert(display_window);
+
+  m_display_widget = QWidget::createWindowContainer(display_window, m_ui.mainContainer);
+  DebugAssert(m_display_widget);
+
+  m_display_widget->setFocusPolicy(Qt::StrongFocus);
+  m_ui.mainContainer->insertWidget(1, m_display_widget);
+
+  // we need the surface visible.. this might be able to be replaced with something else
+  switchToEmulationView();
   QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+  display_window->createDeviceContext(worker_thread, use_debug_device);
+}
+
+void MainWindow::destroyDisplayWindow()
+{
+  DebugAssert(m_display_widget);
+
+  const bool was_fullscreen = m_display_widget->isFullScreen();
+  if (was_fullscreen)
+    toggleFullscreen();
+
+  switchToGameListView();
+
+  // recreate the display widget using the potentially-new renderer
+  m_ui.mainContainer->removeWidget(m_display_widget);
+  delete m_display_widget;
+  m_display_widget = nullptr;
+}
+
+void MainWindow::setFullscreen(bool fullscreen)
+{
+  if (fullscreen)
+  {
+    m_ui.mainContainer->setCurrentIndex(0);
+    m_ui.mainContainer->removeWidget(m_display_widget);
+    m_display_widget->setParent(nullptr);
+    m_display_widget->showFullScreen();
+  }
+  else
+  {
+    m_ui.mainContainer->insertWidget(1, m_display_widget);
+    m_ui.mainContainer->setCurrentIndex(1);
+  }
+
+  m_display_widget->setFocus();
+
+  QSignalBlocker blocker(m_ui.actionFullscreen);
+  m_ui.actionFullscreen->setChecked(fullscreen);
+}
+
+void MainWindow::toggleFullscreen()
+{
+  setFullscreen(!m_display_widget->isFullScreen());
+}
+
+void MainWindow::focusDisplayWidget()
+{
+  if (m_ui.mainContainer->currentIndex() != 1)
+    return;
+
+  m_display_widget->setFocus();
 }
 
 void MainWindow::onEmulationStarted()
@@ -70,62 +141,17 @@ void MainWindow::onEmulationPaused(bool paused)
   m_ui.actionPause->setChecked(paused);
 }
 
-void MainWindow::toggleFullscreen()
+void MainWindow::onStateSaved(const QString& game_code, bool global, qint32 slot)
 {
-  const bool fullscreen = !m_display_widget->isFullScreen();
-  if (fullscreen)
-  {
-    m_ui.mainContainer->setCurrentIndex(0);
-    m_ui.mainContainer->removeWidget(m_display_widget);
-    m_display_widget->setParent(nullptr);
-    m_display_widget->showFullScreen();
-  }
-  else
-  {
-    m_ui.mainContainer->insertWidget(1, m_display_widget);
-    m_ui.mainContainer->setCurrentIndex(1);
-  }
-
-  m_display_widget->setFocus();
-
-  QSignalBlocker blocker(m_ui.actionFullscreen);
-  m_ui.actionFullscreen->setChecked(fullscreen);
-}
-
-void MainWindow::recreateDisplayWidget(bool create_device_context)
-{
-  const bool was_fullscreen = m_display_widget->isFullScreen();
-  if (was_fullscreen)
-    toggleFullscreen();
-
-  switchToGameListView();
-
-  // recreate the display widget using the potentially-new renderer
-  m_ui.mainContainer->removeWidget(m_display_widget);
-  m_host_interface->displayWidgetDestroyed();
-  delete m_display_widget;
-  m_display_widget = m_host_interface->createDisplayWidget(m_ui.mainContainer);
-  m_ui.mainContainer->insertWidget(1, m_display_widget);
-
-  if (create_device_context)
-    switchToEmulationView();
-
-  // we need the surface visible..
-  QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-
-  if (create_device_context && !m_host_interface->createDisplayDeviceContext())
-  {
-    QMessageBox::critical(this, tr("DuckStation Error"),
-                          tr("Failed to create new device context on renderer switch. Cannot continue."));
-    QCoreApplication::exit();
+  // don't bother updating for the resume state since we're powering off anyway
+  if (slot < 0)
     return;
-  }
 
-  updateDebugMenuGPURenderer();
+  m_host_interface->populateSaveStateMenus(game_code.toStdString().c_str(), m_ui.menuLoadState, m_ui.menuSaveState);
 }
 
-void MainWindow::onPerformanceCountersUpdated(float speed, float fps, float vps, float average_frame_time,
-                                              float worst_frame_time)
+void MainWindow::onSystemPerformanceCountersUpdated(float speed, float fps, float vps, float average_frame_time,
+                                                    float worst_frame_time)
 {
   m_status_speed_widget->setText(QStringLiteral("%1%").arg(speed, 0, 'f', 0));
   m_status_fps_widget->setText(
@@ -134,9 +160,9 @@ void MainWindow::onPerformanceCountersUpdated(float speed, float fps, float vps,
     QStringLiteral("%1ms average, %2ms worst").arg(average_frame_time, 0, 'f', 2).arg(worst_frame_time, 0, 'f', 2));
 }
 
-void MainWindow::onRunningGameChanged(QString filename, QString game_code, QString game_title)
+void MainWindow::onRunningGameChanged(const QString& filename, const QString& game_code, const QString& game_title)
 {
-  populateLoadSaveStateMenus(game_code);
+  m_host_interface->populateSaveStateMenus(game_code.toStdString().c_str(), m_ui.menuLoadState, m_ui.menuSaveState);
   if (game_title.isEmpty())
     setWindowTitle(tr("DuckStation"));
   else
@@ -150,7 +176,15 @@ void MainWindow::onStartDiscActionTriggered()
   if (filename.isEmpty())
     return;
 
-  m_host_interface->bootSystem(std::move(filename), QString());
+  SystemBootParameters boot_params;
+  boot_params.filename = filename.toStdString();
+  m_host_interface->bootSystem(boot_params);
+}
+
+void MainWindow::onStartBIOSActionTriggered()
+{
+  SystemBootParameters boot_params;
+  m_host_interface->bootSystem(boot_params);
 }
 
 void MainWindow::onChangeDiscFromFileActionTriggered()
@@ -169,19 +203,18 @@ void MainWindow::onChangeDiscFromGameListActionTriggered()
   switchToGameListView();
 }
 
-void MainWindow::onStartBiosActionTriggered()
+static void OpenURL(QWidget* parent, const QUrl& qurl)
 {
-  m_host_interface->bootSystem(QString(), QString());
-}
-
-static void OpenURL(QWidget* parent, const char* url)
-{
-  const QUrl qurl(QUrl::fromEncoded(QByteArray(url, std::strlen(url))));
   if (!QDesktopServices::openUrl(qurl))
   {
     QMessageBox::critical(parent, QObject::tr("Failed to open URL"),
                           QObject::tr("Failed to open URL.\n\nThe URL was: %1").arg(qurl.toString()));
   }
+}
+
+static void OpenURL(QWidget* parent, const char* url)
+{
+  return OpenURL(parent, QUrl::fromEncoded(QByteArray(url, static_cast<int>(std::strlen(url)))));
 }
 
 void MainWindow::onGitHubRepositoryActionTriggered()
@@ -196,15 +229,95 @@ void MainWindow::onIssueTrackerActionTriggered()
 
 void MainWindow::onAboutActionTriggered() {}
 
+void MainWindow::onGameListEntrySelected(const GameListEntry* entry)
+{
+  if (!entry)
+  {
+    m_ui.statusBar->clearMessage();
+    m_host_interface->populateSaveStateMenus("", m_ui.menuLoadState, m_ui.menuSaveState);
+    return;
+  }
+
+  m_ui.statusBar->showMessage(QString::fromStdString(entry->path));
+  m_host_interface->populateSaveStateMenus(entry->code.c_str(), m_ui.menuLoadState, m_ui.menuSaveState);
+}
+
+void MainWindow::onGameListEntryDoubleClicked(const GameListEntry* entry)
+{
+  // if we're not running, boot the system, otherwise swap discs
+  QString path = QString::fromStdString(entry->path);
+  if (!m_emulation_running)
+  {
+    if (!entry->code.empty() && m_host_interface->getSettingValue("General/SaveStateOnExit", true).toBool())
+    {
+      m_host_interface->resumeSystemFromState(path, true);
+    }
+    else
+    {
+      SystemBootParameters boot_params;
+      boot_params.filename = path.toStdString();
+      m_host_interface->bootSystem(boot_params);
+    }
+  }
+  else
+  {
+    m_host_interface->changeDisc(path);
+    m_host_interface->pauseSystem(false);
+    switchToEmulationView();
+  }
+}
+
+void MainWindow::onGameListContextMenuRequested(const QPoint& point, const GameListEntry* entry)
+{
+  QMenu menu;
+
+  // Hopefully this pointer doesn't disappear... it shouldn't.
+  if (entry)
+  {
+    connect(menu.addAction(tr("Properties...")), &QAction::triggered, [this]() { reportError(tr("TODO")); });
+
+    connect(menu.addAction(tr("Open Containing Directory...")), &QAction::triggered, [this, entry]() {
+      const QFileInfo fi(QString::fromStdString(entry->path));
+      OpenURL(this, QUrl::fromLocalFile(fi.absolutePath()));
+    });
+
+    menu.addSeparator();
+
+    if (!entry->code.empty())
+    {
+      m_host_interface->populateGameListContextMenu(entry->code.c_str(), this, &menu);
+      menu.addSeparator();
+    }
+
+    connect(menu.addAction(tr("Default Boot")), &QAction::triggered,
+            [this, entry]() { m_host_interface->bootSystem(SystemBootParameters(entry->path)); });
+
+    connect(menu.addAction(tr("Fast Boot")), &QAction::triggered, [this, entry]() {
+      SystemBootParameters boot_params(entry->path);
+      boot_params.override_fast_boot = true;
+      m_host_interface->bootSystem(boot_params);
+    });
+
+    connect(menu.addAction(tr("Full Boot")), &QAction::triggered, [this, entry]() {
+      SystemBootParameters boot_params(entry->path);
+      boot_params.override_fast_boot = false;
+      m_host_interface->bootSystem(boot_params);
+    });
+
+    menu.addSeparator();
+  }
+
+  connect(menu.addAction(tr("Add Search Directory...")), &QAction::triggered,
+          [this]() { getSettingsDialog()->getGameListSettingsWidget()->addSearchDirectory(this); });
+
+  menu.exec(point);
+}
+
 void MainWindow::setupAdditionalUi()
 {
   m_game_list_widget = new GameListWidget(m_ui.mainContainer);
   m_game_list_widget->initialize(m_host_interface);
   m_ui.mainContainer->insertWidget(0, m_game_list_widget);
-
-  m_display_widget = m_host_interface->createDisplayWidget(m_ui.mainContainer);
-  m_ui.mainContainer->insertWidget(1, m_display_widget);
-
   m_ui.mainContainer->setCurrentIndex(0);
 
   m_status_speed_widget = new QLabel(m_ui.statusBar);
@@ -305,14 +418,14 @@ void MainWindow::connectSignals()
   onEmulationPaused(false);
 
   connect(m_ui.actionStartDisc, &QAction::triggered, this, &MainWindow::onStartDiscActionTriggered);
-  connect(m_ui.actionStartBios, &QAction::triggered, this, &MainWindow::onStartBiosActionTriggered);
+  connect(m_ui.actionStartBios, &QAction::triggered, this, &MainWindow::onStartBIOSActionTriggered);
   connect(m_ui.actionChangeDisc, &QAction::triggered, [this] { m_ui.menuChangeDisc->exec(QCursor::pos()); });
   connect(m_ui.actionChangeDiscFromFile, &QAction::triggered, this, &MainWindow::onChangeDiscFromFileActionTriggered);
   connect(m_ui.actionChangeDiscFromGameList, &QAction::triggered, this,
           &MainWindow::onChangeDiscFromGameListActionTriggered);
   connect(m_ui.actionAddGameDirectory, &QAction::triggered,
           [this]() { getSettingsDialog()->getGameListSettingsWidget()->addSearchDirectory(this); });
-  connect(m_ui.actionPowerOff, &QAction::triggered, [this]() { m_host_interface->powerOffSystem(true, false); });
+  connect(m_ui.actionPowerOff, &QAction::triggered, m_host_interface, &QtHostInterface::powerOffSystem);
   connect(m_ui.actionReset, &QAction::triggered, m_host_interface, &QtHostInterface::resetSystem);
   connect(m_ui.actionPause, &QAction::toggled, m_host_interface, &QtHostInterface::pauseSystem);
   connect(m_ui.actionLoadState, &QAction::triggered, this, [this]() { m_ui.menuLoadState->exec(QCursor::pos()); });
@@ -338,42 +451,28 @@ void MainWindow::connectSignals()
   connect(m_host_interface, &QtHostInterface::errorReported, this, &MainWindow::reportError,
           Qt::BlockingQueuedConnection);
   connect(m_host_interface, &QtHostInterface::messageReported, this, &MainWindow::reportMessage);
-  connect(m_host_interface, &QtHostInterface::emulationStarting, this, &MainWindow::onEmulationStarting);
+  connect(m_host_interface, &QtHostInterface::messageConfirmed, this, &MainWindow::confirmMessage,
+          Qt::BlockingQueuedConnection);
+  connect(m_host_interface, &QtHostInterface::createDisplayWindowRequested, this, &MainWindow::createDisplayWindow,
+          Qt::BlockingQueuedConnection);
+  connect(m_host_interface, &QtHostInterface::destroyDisplayWindowRequested, this, &MainWindow::destroyDisplayWindow);
+  connect(m_host_interface, &QtHostInterface::setFullscreenRequested, this, &MainWindow::setFullscreen);
+  connect(m_host_interface, &QtHostInterface::toggleFullscreenRequested, this, &MainWindow::toggleFullscreen);
+  connect(m_host_interface, &QtHostInterface::focusDisplayWidgetRequested, this, &MainWindow::focusDisplayWidget);
   connect(m_host_interface, &QtHostInterface::emulationStarted, this, &MainWindow::onEmulationStarted);
   connect(m_host_interface, &QtHostInterface::emulationStopped, this, &MainWindow::onEmulationStopped);
   connect(m_host_interface, &QtHostInterface::emulationPaused, this, &MainWindow::onEmulationPaused);
-  connect(m_host_interface, &QtHostInterface::toggleFullscreenRequested, this, &MainWindow::toggleFullscreen);
-  connect(m_host_interface, &QtHostInterface::recreateDisplayWidgetRequested, this, &MainWindow::recreateDisplayWidget,
-          Qt::BlockingQueuedConnection);
-  connect(m_host_interface, &QtHostInterface::performanceCountersUpdated, this,
-          &MainWindow::onPerformanceCountersUpdated);
+  connect(m_host_interface, &QtHostInterface::stateSaved, this, &MainWindow::onStateSaved);
+  connect(m_host_interface, &QtHostInterface::systemPerformanceCountersUpdated, this,
+          &MainWindow::onSystemPerformanceCountersUpdated);
   connect(m_host_interface, &QtHostInterface::runningGameChanged, this, &MainWindow::onRunningGameChanged);
 
-  connect(m_game_list_widget, &GameListWidget::bootEntryRequested, [this](const GameListEntry* entry) {
-    // if we're not running, boot the system, otherwise swap discs
-    QString path = QString::fromStdString(entry->path);
-    if (!m_emulation_running)
-    {
-      m_host_interface->bootSystem(path, QString());
-    }
-    else
-    {
-      m_host_interface->changeDisc(path);
-      m_host_interface->pauseSystem(false);
-      switchToEmulationView();
-    }
-  });
-  connect(m_game_list_widget, &GameListWidget::entrySelected, [this](const GameListEntry* entry) {
-    if (!entry)
-    {
-      m_ui.statusBar->clearMessage();
-      populateLoadSaveStateMenus(QString());
-      return;
-    }
+  connect(m_game_list_widget, &GameListWidget::entrySelected, this, &MainWindow::onGameListEntrySelected);
+  connect(m_game_list_widget, &GameListWidget::entryDoubleClicked, this, &MainWindow::onGameListEntryDoubleClicked);
+  connect(m_game_list_widget, &GameListWidget::entryContextMenuRequested, this,
+          &MainWindow::onGameListContextMenuRequested);
 
-    m_ui.statusBar->showMessage(QString::fromStdString(entry->path));
-    populateLoadSaveStateMenus(QString::fromStdString(entry->code));
-  });
+  m_host_interface->populateSaveStateMenus(nullptr, m_ui.menuLoadState, m_ui.menuSaveState);
 
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.actionDebugShowVRAM, "Debug/ShowVRAM");
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.actionDebugDumpCPUtoVRAMCopies,
@@ -443,41 +542,8 @@ void MainWindow::updateDebugMenuGPURenderer()
   }
 }
 
-void MainWindow::populateLoadSaveStateMenus(QString game_code)
-{
-  static constexpr int NUM_SAVE_STATE_SLOTS = 10;
-
-  QMenu* const load_menu = m_ui.menuLoadState;
-  QMenu* const save_menu = m_ui.menuSaveState;
-
-  load_menu->clear();
-  save_menu->clear();
-
-  load_menu->addAction(tr("Resume State"));
-  load_menu->addSeparator();
-
-  for (int i = 0; i < NUM_SAVE_STATE_SLOTS; i++)
-  {
-    // TODO: Do we want to test for the existance of these on disk here?
-    load_menu->addAction(tr("Global Save %1 (2020-01-01 00:01:02)").arg(i + 1));
-    save_menu->addAction(tr("Global Save %1").arg(i + 1));
-  }
-
-  if (!game_code.isEmpty())
-  {
-    load_menu->addSeparator();
-    save_menu->addSeparator();
-
-    for (int i = 0; i < NUM_SAVE_STATE_SLOTS; i++)
-    {
-      load_menu->addAction(tr("Game Save %1 (2020-01-01 00:01:02)").arg(i + 1));
-      save_menu->addAction(tr("Game Save %1").arg(i + 1));
-    }
-  }
-}
-
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-  m_host_interface->powerOffSystem(true, true);
+  m_host_interface->synchronousPowerOffSystem();
   QMainWindow::closeEvent(event);
 }

@@ -25,6 +25,7 @@ public:
   void* GetRenderWindow() const override;
 
   void ChangeRenderWindow(void* new_window) override;
+  void WindowResized(s32 new_window_width, s32 new_window_height) override;
 
   std::unique_ptr<HostDisplayTexture> CreateTexture(u32 width, u32 height, const void* data, u32 data_stride,
                                                     bool dynamic) override;
@@ -32,9 +33,6 @@ public:
                      u32 data_stride) override;
 
   void SetVSync(bool enabled) override;
-
-  std::tuple<u32, u32> GetWindowSize() const override;
-  void WindowResized() override;
 
 private:
   static constexpr u32 DISPLAY_UNIFORM_BUFFER_SIZE = 16;
@@ -44,13 +42,11 @@ private:
   bool CreateSwapChainRTV();
   bool CreateImGuiContext();
 
-  void Render();
+  void Render() override;
   void RenderDisplay();
 
   SDL_Window* m_window = nullptr;
   SDL_GLContext m_gl_context = nullptr;
-  int m_window_width = 0;
-  int m_window_height = 0;
 
   ComPtr<ID3D11Device> m_device;
   ComPtr<ID3D11DeviceContext> m_context;
@@ -69,5 +65,5 @@ private:
   D3D11::StreamBuffer m_display_uniform_buffer;
 
   bool m_allow_tearing_supported = false;
-  bool m_vsync = false;
+  bool m_vsync = true;
 };

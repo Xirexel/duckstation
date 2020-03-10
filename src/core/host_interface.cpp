@@ -6,7 +6,6 @@
 #include "common/file_system.h"
 #include "common/log.h"
 #include "common/string_util.h"
-#include "common/timer.h"
 #include "dma.h"
 #include "game_list.h"
 #include "gpu.h"
@@ -18,12 +17,12 @@
 #include <cmath>
 #include <cstring>
 #include <imgui.h>
+#include <stdlib.h>
 Log_SetChannel(HostInterface);
 
-#ifdef _WIN32
+#ifdef WIN32
 #include "common/windows_headers.h"
-#else
-#include <time.h>
+#include <mmsystem.h>
 #endif
 
 #if defined(ANDROID) || (defined(__GNUC__) && __GNUC__ < 8)
@@ -54,52 +53,109 @@ HostInterface::HostInterface()
 {
   SetUserDirectory();
   CreateUserDirectorySubdirectories();
-  SetDefaultSettings();
   m_game_list = std::make_unique<GameList>();
   m_game_list->SetCacheFilename(GetGameListCacheFileName());
   m_game_list->SetDatabaseFilename(GetGameListDatabaseFileName());
-  m_last_throttle_time = Common::Timer::GetValue();
 }
 
-HostInterface::~HostInterface() = default;
-
-bool HostInterface::CreateSystem()
+HostInterface::~HostInterface()
 {
-  m_system = System::Create(this);
-
-  // Pull in any invalid settings which have been reset.
-  m_settings = m_system->GetSettings();
-  m_paused = true;
-  UpdateSpeedLimiterState();
-  return true;
+  // system should be shut down prior to the destructor
+  Assert(!m_system && !m_audio_stream && !m_display);
 }
 
-bool HostInterface::BootSystem(const char* filename, const char* state_filename)
+void HostInterface::CreateAudioStream()
 {
-  if (!m_system->Boot(filename))
+  m_audio_stream = CreateAudioStream(m_settings.audio_backend);
+
+  if (m_audio_stream && m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BUFFER_SIZE, 4))
+    return;
+
+  ReportFormattedError("Failed to create or configure audio stream, falling back to null output.");
+  m_audio_stream.reset();
+  m_audio_stream = AudioStream::CreateNullAudioStream();
+  m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BUFFER_SIZE, 4);
+}
+
+bool HostInterface::BootSystem(const SystemBootParameters& parameters)
+{
+  if (!AcquireHostDisplay())
+  {
+    ReportFormattedError("Failed to acquire host display");
     return false;
+  }
+
+  // set host display settings
+  m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
+
+  // create the audio stream. this will never fail, since we'll just fall back to null
+  CreateAudioStream();
+
+  m_system = System::Create(this);
+  if (!m_system->Boot(parameters))
+  {
+    ReportFormattedError("System failed to boot. The log may contain more information.");
+    DestroySystem();
+    return false;
+  }
+
+  OnSystemCreated();
 
   m_paused = m_settings.start_paused;
+  m_audio_stream->PauseOutput(m_paused);
   UpdateSpeedLimiterState();
 
-  if (state_filename && !LoadState(state_filename))
-    return false;
+  if (m_paused)
+    OnSystemPaused(true);
 
   return true;
+}
+
+void HostInterface::PauseSystem(bool paused)
+{
+  if (paused == m_paused)
+    return;
+
+  m_paused = paused;
+  m_audio_stream->PauseOutput(m_paused);
+  OnSystemPaused(paused);
+  UpdateSpeedLimiterState();
+
+  if (!paused)
+    m_system->ResetPerformanceCounters();
 }
 
 void HostInterface::ResetSystem()
 {
   m_system->Reset();
-  ResetPerformanceCounters();
+  m_system->ResetPerformanceCounters();
   AddOSDMessage("System reset.");
+}
+
+void HostInterface::PowerOffSystem()
+{
+  if (!m_system)
+    return;
+
+  if (m_settings.save_state_on_exit)
+    SaveResumeSaveState();
+
+  DestroySystem();
 }
 
 void HostInterface::DestroySystem()
 {
-  m_system.reset();
+  if (!m_system)
+    return;
+
+  SetTimerResolutionIncreased(false);
+
   m_paused = false;
-  UpdateSpeedLimiterState();
+  m_system.reset();
+  m_audio_stream.reset();
+  ReleaseHostDisplay();
+  OnSystemDestroyed();
+  OnRunningGameChanged();
 }
 
 void HostInterface::ReportError(const char* message)
@@ -110,6 +166,12 @@ void HostInterface::ReportError(const char* message)
 void HostInterface::ReportMessage(const char* message)
 {
   Log_InfoPrintf(message);
+}
+
+bool HostInterface::ConfirmMessage(const char* message)
+{
+  Log_WarningPrintf("ConfirmMessage(\"%s\") -> Yes");
+  return true;
 }
 
 void HostInterface::ReportFormattedError(const char* format, ...)
@@ -132,13 +194,23 @@ void HostInterface::ReportFormattedMessage(const char* format, ...)
   ReportMessage(message.c_str());
 }
 
+bool HostInterface::ConfirmFormattedMessage(const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+  std::string message = StringUtil::StdStringFromFormatV(format, ap);
+  va_end(ap);
+
+  return ConfirmMessage(message.c_str());
+}
+
 void HostInterface::DrawFPSWindow()
 {
   const bool show_fps = true;
   const bool show_vps = true;
   const bool show_speed = true;
 
-  if (!(show_fps | show_vps | show_speed))
+  if (!(show_fps | show_vps | show_speed) || !m_system)
     return;
 
   const ImVec2 window_size =
@@ -158,7 +230,7 @@ void HostInterface::DrawFPSWindow()
   bool first = true;
   if (show_fps)
   {
-    ImGui::Text("%.2f", m_fps);
+    ImGui::Text("%.2f", m_system->GetFPS());
     first = false;
   }
   if (show_vps)
@@ -174,7 +246,7 @@ void HostInterface::DrawFPSWindow()
       ImGui::SameLine();
     }
 
-    ImGui::Text("%.2f", m_vps);
+    ImGui::Text("%.2f", m_system->GetVPS());
   }
   if (show_speed)
   {
@@ -189,10 +261,11 @@ void HostInterface::DrawFPSWindow()
       ImGui::SameLine();
     }
 
-    const u32 rounded_speed = static_cast<u32>(std::round(m_speed));
-    if (m_speed < 90.0f)
+    const float speed = m_system->GetEmulationSpeed();
+    const u32 rounded_speed = static_cast<u32>(std::round(speed));
+    if (speed < 90.0f)
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%u%%", rounded_speed);
-    else if (m_speed < 110.0f)
+    else if (speed < 110.0f)
       ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%u%%", rounded_speed);
     else
       ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%u%%", rounded_speed);
@@ -290,11 +363,6 @@ void HostInterface::DrawDebugWindows()
     m_system->GetMDEC()->DrawDebugStateWindow();
 }
 
-void HostInterface::ClearImGuiFocus()
-{
-  ImGui::SetWindowFocus(nullptr);
-}
-
 std::optional<std::vector<u8>> HostInterface::GetBIOSImage(ConsoleRegion region)
 {
   // Try the other default filenames in the directory of the configured BIOS.
@@ -303,12 +371,15 @@ std::optional<std::vector<u8>> HostInterface::GetBIOSImage(ConsoleRegion region)
   {                                                                                                                    \
     std::string try_filename = filename;                                                                               \
     std::optional<BIOS::Image> found_image = BIOS::LoadImageFromFile(try_filename);                                    \
-    BIOS::Hash found_hash = BIOS::GetHash(*found_image);                                                               \
-    Log_DevPrintf("Hash for BIOS '%s': %s", try_filename.c_str(), found_hash.ToString().c_str());                      \
-    if (BIOS::IsValidHashForRegion(region, found_hash))                                                                \
+    if (found_image)                                                                                                   \
     {                                                                                                                  \
-      Log_InfoPrintf("Using BIOS from '%s'", try_filename.c_str());                                                    \
-      return found_image;                                                                                              \
+      BIOS::Hash found_hash = BIOS::GetHash(*found_image);                                                             \
+      Log_DevPrintf("Hash for BIOS '%s': %s", try_filename.c_str(), found_hash.ToString().c_str());                    \
+      if (BIOS::IsValidHashForRegion(region, found_hash))                                                              \
+      {                                                                                                                \
+        Log_InfoPrintf("Using BIOS from '%s'", try_filename.c_str());                                                  \
+        return found_image;                                                                                            \
+      }                                                                                                                \
     }                                                                                                                  \
   } while (0)
 
@@ -347,61 +418,55 @@ std::optional<std::vector<u8>> HostInterface::GetBIOSImage(ConsoleRegion region)
   return BIOS::LoadImageFromFile(m_settings.bios_path);
 }
 
-void HostInterface::Throttle()
-{
-  // Allow variance of up to 40ms either way.
-  constexpr s64 MAX_VARIANCE_TIME = INT64_C(40000000);
-
-  // Don't sleep for <1ms or >=period.
-  constexpr s64 MINIMUM_SLEEP_TIME = INT64_C(1000000);
-
-  // Use unsigned for defined overflow/wrap-around.
-  const u64 time = static_cast<u64>(m_throttle_timer.GetTimeNanoseconds());
-  const s64 sleep_time = static_cast<s64>(m_last_throttle_time - time);
-  if (std::abs(sleep_time) >= MAX_VARIANCE_TIME)
-  {
-#ifndef _DEBUG
-    // Don't display the slow messages in debug, it'll always be slow...
-    // Limit how often the messages are displayed.
-    if (m_speed_lost_time_timestamp.GetTimeSeconds() >= 1.0f)
-    {
-      Log_WarningPrintf("System too %s, lost %.2f ms", sleep_time < 0 ? "slow" : "fast",
-                        static_cast<double>(std::abs(sleep_time) - MAX_VARIANCE_TIME) / 1000000.0);
-      m_speed_lost_time_timestamp.Reset();
-    }
-#endif
-    m_last_throttle_time = 0;
-    m_throttle_timer.Reset();
-  }
-  else if (sleep_time >= MINIMUM_SLEEP_TIME && sleep_time <= m_throttle_period)
-  {
-#ifdef WIN32
-    Sleep(static_cast<u32>(sleep_time / 1000000));
-#else
-    const struct timespec ts = {0, static_cast<long>(sleep_time)};
-    nanosleep(&ts, nullptr);
-#endif
-  }
-
-  m_last_throttle_time += m_throttle_period;
-}
-
 bool HostInterface::LoadState(const char* filename)
 {
   std::unique_ptr<ByteStream> stream = FileSystem::OpenFile(filename, BYTESTREAM_OPEN_READ | BYTESTREAM_OPEN_STREAMED);
   if (!stream)
     return false;
 
-  AddFormattedOSDMessage(2.0f, "Loading state from %s...", filename);
+  AddFormattedOSDMessage(2.0f, "Loading state from '%s'...", filename);
 
-  const bool result = m_system->LoadState(stream.get());
-  if (!result)
+  if (m_system)
   {
-    ReportFormattedError("Loading state from %s failed. Resetting.", filename);
-    m_system->Reset();
+    if (!m_system->LoadState(stream.get()))
+    {
+      ReportFormattedError("Loading state from '%s' failed. Resetting.", filename);
+      m_system->Reset();
+      return false;
+    }
+  }
+  else
+  {
+    SystemBootParameters boot_params;
+    if (!BootSystem(boot_params))
+    {
+      ReportFormattedError("Failed to boot system to load state from '%s'.", filename);
+      return false;
+    }
+
+    if (!m_system->LoadState(stream.get()))
+    {
+      ReportFormattedError("Failed to load state. The log may contain more information. Shutting down system.");
+      DestroySystem();
+      return false;
+    }
   }
 
-  return result;
+  m_system->ResetPerformanceCounters();
+  return true;
+}
+
+bool HostInterface::LoadState(bool global, s32 slot)
+{
+  if (!global && (!m_system || m_system->GetRunningCode().empty()))
+  {
+    ReportFormattedError("Can't save per-game state without a running game code.");
+    return false;
+  }
+
+  std::string save_path =
+    global ? GetGlobalSaveStateFileName(slot) : GetGameSaveStateFileName(m_system->GetRunningCode().c_str(), slot);
+  return LoadState(save_path.c_str());
 }
 
 bool HostInterface::SaveState(const char* filename)
@@ -415,24 +480,96 @@ bool HostInterface::SaveState(const char* filename)
   const bool result = m_system->SaveState(stream.get());
   if (!result)
   {
-    ReportFormattedError("Saving state to %s failed.", filename);
+    ReportFormattedError("Saving state to '%s' failed.", filename);
     stream->Discard();
   }
   else
   {
-    AddFormattedOSDMessage(2.0f, "State saved to %s.", filename);
+    AddFormattedOSDMessage(2.0f, "State saved to '%s'.", filename);
     stream->Commit();
   }
 
   return result;
 }
 
+bool HostInterface::SaveState(bool global, s32 slot)
+{
+  const std::string& code = m_system->GetRunningCode();
+  if (!global && code.empty())
+  {
+    ReportFormattedError("Can't save per-game state without a running game code.");
+    return false;
+  }
+
+  std::string save_path = global ? GetGlobalSaveStateFileName(slot) : GetGameSaveStateFileName(code.c_str(), slot);
+  if (!SaveState(save_path.c_str()))
+    return false;
+
+  OnSystemStateSaved(global, slot);
+  return true;
+}
+
+bool HostInterface::ResumeSystemFromState(const char* filename, bool boot_on_failure)
+{
+  SystemBootParameters boot_params;
+  boot_params.filename = filename;
+  if (!BootSystem(boot_params))
+    return false;
+
+  const bool global = m_system->GetRunningCode().empty();
+  if (m_system->GetRunningCode().empty())
+  {
+    ReportFormattedError("Cannot resume system with undetectable game code from '%s'.", filename);
+    if (!boot_on_failure)
+    {
+      DestroySystem();
+      return true;
+    }
+  }
+  else
+  {
+    const std::string path = GetGameSaveStateFileName(m_system->GetRunningCode().c_str(), -1);
+    if (FileSystem::FileExists(path.c_str()))
+    {
+      if (!LoadState(path.c_str()) && !boot_on_failure)
+      {
+        DestroySystem();
+        return false;
+      }
+    }
+    else if (!boot_on_failure)
+    {
+      ReportFormattedError("Resume save state not found for '%s' ('%s').", m_system->GetRunningCode().c_str(),
+                           m_system->GetRunningTitle().c_str());
+      DestroySystem();
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool HostInterface::ResumeSystemFromMostRecentState()
+{
+  const std::string path = GetMostRecentResumeSaveStatePath();
+  if (path.empty())
+  {
+    ReportError("No resume save state found.");
+    return false;
+  }
+
+  return LoadState(path.c_str());
+}
+
 void HostInterface::UpdateSpeedLimiterState()
 {
   m_speed_limiter_enabled = m_settings.speed_limiter_enabled && !m_speed_limiter_temp_disabled;
 
-  const bool audio_sync_enabled = !m_system || m_paused || (m_speed_limiter_enabled && m_settings.audio_sync_enabled);
-  const bool video_sync_enabled = !m_system || m_paused || (m_speed_limiter_enabled && m_settings.video_sync_enabled);
+  const bool is_non_standard_speed = (std::abs(m_settings.emulation_speed - 1.0f) > 0.05f);
+  const bool audio_sync_enabled =
+    !m_system || m_paused || (m_speed_limiter_enabled && m_settings.audio_sync_enabled && !is_non_standard_speed);
+  const bool video_sync_enabled =
+    !m_system || m_paused || (m_speed_limiter_enabled && m_settings.video_sync_enabled && !is_non_standard_speed);
   Log_InfoPrintf("Syncing to %s%s", audio_sync_enabled ? "audio" : "",
                  (audio_sync_enabled && video_sync_enabled) ? " and video" : (video_sync_enabled ? "video" : ""));
 
@@ -441,36 +578,91 @@ void HostInterface::UpdateSpeedLimiterState()
     m_audio_stream->EmptyBuffers();
 
   m_display->SetVSync(video_sync_enabled);
-  m_throttle_timer.Reset();
-  m_last_throttle_time = 0;
+
+  if (m_settings.increase_timer_resolution)
+    SetTimerResolutionIncreased(m_speed_limiter_enabled);
+
+  m_system->ResetPerformanceCounters();
 }
 
-void HostInterface::SwitchGPURenderer() {}
+void HostInterface::OnSystemCreated() {}
 
-void HostInterface::OnPerformanceCountersUpdated() {}
+void HostInterface::OnSystemPaused(bool paused)
+{
+  ReportFormattedMessage("System %s.", paused ? "paused" : "resumed");
+}
+
+void HostInterface::OnSystemDestroyed()
+{
+  ReportFormattedMessage("System shut down.");
+}
+
+void HostInterface::OnSystemPerformanceCountersUpdated() {}
+
+void HostInterface::OnSystemStateSaved(bool global, s32 slot) {}
 
 void HostInterface::OnRunningGameChanged() {}
 
+void HostInterface::OnControllerTypeChanged(u32 slot) {}
+
 void HostInterface::SetUserDirectory()
 {
-#ifdef WIN32
-  // On Windows, use the path to the program.
-  // We might want to use My Documents in the future.
   const std::string program_path = FileSystem::GetProgramPath();
-  Log_InfoPrintf("Program path: %s", program_path.c_str());
+  const std::string program_directory = FileSystem::GetPathDirectory(program_path.c_str());
+  Log_InfoPrintf("Program path: \"%s\" (directory \"%s\")", program_path.c_str(), program_directory.c_str());
 
-  m_user_directory = FileSystem::GetPathDirectory(program_path.c_str());
-#else
+  if (FileSystem::FileExists(StringUtil::StdStringFromFormat("%s%c%s", program_directory.c_str(),
+                                                             FS_OSPATH_SEPERATOR_CHARACTER, "portable.txt")
+                               .c_str()))
+  {
+    Log_InfoPrintf("portable.txt found, using program directory as user directory.");
+    m_user_directory = program_directory;
+  }
+  else
+  {
+#ifdef WIN32
+    // On Windows, use the path to the program. We might want to use My Documents in the future.
+    m_user_directory = program_directory;
+#elif __linux__
+    // On Linux, use .local/share/duckstation as a user directory by default.
+    const char* xdg_data_home = getenv("XDG_DATA_HOME");
+    if (xdg_data_home && xdg_data_home[0] == '/')
+    {
+      m_user_directory = StringUtil::StdStringFromFormat("%s/duckstation", xdg_data_home);
+    }
+    else
+    {
+      const char* home_path = getenv("HOME");
+      if (!home_path)
+        m_user_directory = program_directory;
+      else
+        m_user_directory = StringUtil::StdStringFromFormat("%s/.local/share/duckstation", home_path);
+    }
+#elif __APPLE__
+    // On macOS, default to ~/Library/Application Support/DuckStation.
+    const char* home_path = getenv("HOME");
+    if (!home_path)
+      m_user_directory = program_directory;
+    else
+      m_user_directory = StringUtil::StdStringFromFormat("%s/Library/Application Support/DuckStation", home_path);
 #endif
+  }
 
-  Log_InfoPrintf("User directory: %s", m_user_directory.c_str());
+  Log_InfoPrintf("User directory: \"%s\"", m_user_directory.c_str());
+
+  if (m_user_directory.empty())
+    Panic("Cannot continue without user directory set.");
+
+  if (!FileSystem::DirectoryExists(m_user_directory.c_str()))
+  {
+    Log_WarningPrintf("User directory \"%s\" does not exist, creating.", m_user_directory.c_str());
+    if (!FileSystem::CreateDirectory(m_user_directory.c_str(), true))
+      Log_ErrorPrintf("Failed to create user directory \"%s\".", m_user_directory.c_str());
+  }
 
   // Change to the user directory so that all default/relative paths in the config are after this.
-  if (!m_user_directory.empty())
-  {
-    if (!FileSystem::SetWorkingDirectory(m_user_directory.c_str()))
-      Log_ErrorPrintf("Failed to set working directory to '%s'", m_user_directory.c_str());
-  }
+  if (!FileSystem::SetWorkingDirectory(m_user_directory.c_str()))
+    Log_ErrorPrintf("Failed to set working directory to '%s'", m_user_directory.c_str());
 }
 
 void HostInterface::CreateUserDirectorySubdirectories()
@@ -519,7 +711,7 @@ std::string HostInterface::GetGameListDatabaseFileName() const
   return GetUserDirectoryRelativePath("cache/redump.dat");
 }
 
-std::string HostInterface::GetGameSaveStateFileName(const char* game_code, s32 slot)
+std::string HostInterface::GetGameSaveStateFileName(const char* game_code, s32 slot) const
 {
   if (slot < 0)
     return GetUserDirectoryRelativePath("savestates/%s_resume.sav", game_code);
@@ -527,7 +719,7 @@ std::string HostInterface::GetGameSaveStateFileName(const char* game_code, s32 s
     return GetUserDirectoryRelativePath("savestates/%s_%d.sav", game_code, slot);
 }
 
-std::string HostInterface::GetGlobalSaveStateFileName(s32 slot)
+std::string HostInterface::GetGlobalSaveStateFileName(s32 slot) const
 {
   if (slot < 0)
     return GetUserDirectoryRelativePath("savestates/resume.sav");
@@ -535,87 +727,222 @@ std::string HostInterface::GetGlobalSaveStateFileName(s32 slot)
     return GetUserDirectoryRelativePath("savestates/savestate_%d.sav", slot);
 }
 
-std::string HostInterface::GetSharedMemoryCardPath(u32 slot)
+std::string HostInterface::GetSharedMemoryCardPath(u32 slot) const
 {
   return GetUserDirectoryRelativePath("memcards/shared_card_%d.mcd", slot + 1);
 }
 
-std::string HostInterface::GetGameMemoryCardPath(const char* game_code, u32 slot)
+std::string HostInterface::GetGameMemoryCardPath(const char* game_code, u32 slot) const
 {
   return GetUserDirectoryRelativePath("memcards/game_card_%s_%d.mcd", game_code, slot + 1);
 }
 
-void HostInterface::SetDefaultSettings()
+std::vector<HostInterface::SaveStateInfo> HostInterface::GetAvailableSaveStates(const char* game_code) const
 {
-  m_settings.region = ConsoleRegion::Auto;
-  m_settings.cpu_execution_mode = CPUExecutionMode::Interpreter;
+  std::vector<SaveStateInfo> si;
+  std::string path;
 
-  m_settings.speed_limiter_enabled = true;
-  m_settings.start_paused = false;
+  auto add_path = [&si](std::string path, s32 slot, bool global) {
+    FILESYSTEM_STAT_DATA sd;
+    if (!FileSystem::StatFile(path.c_str(), &sd))
+      return;
 
-  m_settings.gpu_renderer = GPURenderer::HardwareOpenGL;
-  m_settings.gpu_resolution_scale = 1;
-  m_settings.gpu_true_color = true;
-  m_settings.gpu_texture_filtering = false;
-  m_settings.gpu_force_progressive_scan = true;
-  m_settings.gpu_use_debug_device = false;
-  m_settings.display_linear_filtering = true;
-  m_settings.display_fullscreen = false;
-  m_settings.video_sync_enabled = true;
+    si.push_back(SaveStateInfo{std::move(path), sd.ModificationTime.AsUnixTimestamp(), static_cast<s32>(slot), global});
+  };
 
-  m_settings.audio_backend = AudioBackend::Default;
-  m_settings.audio_sync_enabled = true;
+  if (game_code && std::strlen(game_code) > 0)
+  {
+    add_path(GetGameSaveStateFileName(game_code, -1), -1, false);
+    for (s32 i = 1; i <= PER_GAME_SAVE_STATE_SLOTS; i++)
+      add_path(GetGameSaveStateFileName(game_code, i), i, false);
+  }
 
-  m_settings.bios_path = GetUserDirectoryRelativePath("bios/scph1001.bin");
-  m_settings.bios_patch_tty_enable = false;
-  m_settings.bios_patch_fast_boot = false;
+  for (s32 i = 1; i <= GLOBAL_SAVE_STATE_SLOTS; i++)
+    add_path(GetGlobalSaveStateFileName(i), i, true);
 
-  m_settings.controller_types[0] = ControllerType::DigitalController;
-  m_settings.controller_types[1] = ControllerType::None;
+  return si;
+}
 
-  m_settings.memory_card_paths[0] = GetSharedMemoryCardPath(0);
-  m_settings.memory_card_paths[1] = GetSharedMemoryCardPath(1);
+void HostInterface::DeleteSaveStates(const char* game_code, bool resume)
+{
+  const std::vector<SaveStateInfo> states(GetAvailableSaveStates(game_code));
+  for (const SaveStateInfo& si : states)
+  {
+    if (si.global || (!resume && si.slot < 0))
+      continue;
+
+    Log_InfoPrintf("Removing save state at '%s'", si.path.c_str());
+    if (!FileSystem::DeleteFile(si.path.c_str()))
+      Log_ErrorPrintf("Failed to delete save state file '%s'", si.path.c_str());
+  }
+}
+
+std::string HostInterface::GetMostRecentResumeSaveStatePath() const
+{
+  std::vector<FILESYSTEM_FIND_DATA> files;
+  if (!FileSystem::FindFiles(GetUserDirectoryRelativePath("savestates").c_str(), "*resume.sav", FILESYSTEM_FIND_FILES,
+                             &files) ||
+      files.empty())
+  {
+    return {};
+  }
+
+  FILESYSTEM_FIND_DATA* most_recent = &files[0];
+  for (FILESYSTEM_FIND_DATA& file : files)
+  {
+    if (file.ModificationTime > most_recent->ModificationTime)
+      most_recent = &file;
+  }
+
+  return std::move(most_recent->FileName);
+}
+
+void HostInterface::CheckSettings(SettingsInterface& si)
+{
+  const int settings_version = si.GetIntValue("Main", "SettingsVersion", -1);
+  if (settings_version == SETTINGS_VERSION)
+    return;
+
+  // TODO: we probably should delete all the sections in the ini...
+  Log_WarningPrintf("Settings version %d does not match expected version %d, resetting", settings_version,
+                    SETTINGS_VERSION);
+  si.Clear();
+  si.SetIntValue("Main", "SettingsVersion", SETTINGS_VERSION);
+  SetDefaultSettings(si);
+}
+
+void HostInterface::SetDefaultSettings(SettingsInterface& si)
+{
+  si.SetStringValue("Console", "Region", Settings::GetConsoleRegionName(ConsoleRegion::Auto));
+
+  si.SetFloatValue("Main", "EmulationSpeed", 1.0f);
+  si.SetBoolValue("Main", "SpeedLimiterEnabled", true);
+  si.SetBoolValue("Main", "IncreaseTimerResolution", true);
+  si.SetBoolValue("Main", "StartPaused", false);
+  si.SetBoolValue("Main", "SaveStateOnExit", true);
+  si.SetBoolValue("Main", "ConfirmPowerOff", true);
+
+  si.SetStringValue("CPU", "ExecutionMode", Settings::GetCPUExecutionModeName(CPUExecutionMode::Interpreter));
+
+  si.SetStringValue("GPU", "Renderer", Settings::GetRendererName(Settings::DEFAULT_GPU_RENDERER));
+  si.SetIntValue("GPU", "ResolutionScale", 1);
+  si.SetBoolValue("GPU", "TrueColor", true);
+  si.SetBoolValue("GPU", "ScaledDithering", false);
+  si.SetBoolValue("GPU", "TextureFiltering", false);
+  si.SetBoolValue("GPU", "UseDebugDevice", false);
+
+  si.SetStringValue("Display", "CropMode", "Overscan");
+  si.SetBoolValue("Display", "ForceProgressiveScan", true);
+  si.SetBoolValue("Display", "LinearFiltering", true);
+  si.SetBoolValue("Display", "Fullscreen", false);
+  si.SetBoolValue("Display", "VSync", true);
+
+  si.SetBoolValue("CDROM", "ReadThread", true);
+
+  si.SetStringValue("Audio", "Backend", Settings::GetAudioBackendName(AudioBackend::Cubeb));
+  si.SetBoolValue("Audio", "Sync", true);
+
+  si.SetStringValue("BIOS", "Path", "bios/scph1001.bin");
+  si.SetBoolValue("BIOS", "PatchTTYEnable", false);
+  si.SetBoolValue("BIOS", "PatchFastBoot", false);
+
+  si.SetStringValue("Controller1", "Type", Settings::GetControllerTypeName(ControllerType::DigitalController));
+  si.SetStringValue("Controller2", "Type", Settings::GetControllerTypeName(ControllerType::None));
+
+  si.SetStringValue("MemoryCards", "Card1Path", "memcards/shared_card_1.mcd");
+  si.SetStringValue("MemoryCards", "Card2Path", "");
+
+  si.SetBoolValue("Debug", "ShowVRAM", false);
+  si.SetBoolValue("Debug", "DumpCPUToVRAMCopies", false);
+  si.SetBoolValue("Debug", "DumpVRAMToCPUCopies", false);
+  si.SetBoolValue("Debug", "ShowGPUState", false);
+  si.SetBoolValue("Debug", "ShowCDROMState", false);
+  si.SetBoolValue("Debug", "ShowSPUState", false);
+  si.SetBoolValue("Debug", "ShowTimersState", false);
+  si.SetBoolValue("Debug", "ShowMDECState", false);
 }
 
 void HostInterface::UpdateSettings(const std::function<void()>& apply_callback)
 {
+  const bool old_increase_timer_resolution = m_settings.increase_timer_resolution;
+  const float old_emulation_speed = m_settings.emulation_speed;
   const CPUExecutionMode old_cpu_execution_mode = m_settings.cpu_execution_mode;
+  const AudioBackend old_audio_backend = m_settings.audio_backend;
   const GPURenderer old_gpu_renderer = m_settings.gpu_renderer;
   const u32 old_gpu_resolution_scale = m_settings.gpu_resolution_scale;
   const bool old_gpu_true_color = m_settings.gpu_true_color;
+  const bool old_gpu_scaled_dithering = m_settings.gpu_scaled_dithering;
   const bool old_gpu_texture_filtering = m_settings.gpu_texture_filtering;
-  const bool old_gpu_force_progressive_scan = m_settings.gpu_force_progressive_scan;
+  const bool old_display_force_progressive_scan = m_settings.display_force_progressive_scan;
+  const bool old_gpu_debug_device = m_settings.gpu_use_debug_device;
   const bool old_vsync_enabled = m_settings.video_sync_enabled;
   const bool old_audio_sync_enabled = m_settings.audio_sync_enabled;
   const bool old_speed_limiter_enabled = m_settings.speed_limiter_enabled;
+  const DisplayCropMode old_display_crop_mode = m_settings.display_crop_mode;
   const bool old_display_linear_filtering = m_settings.display_linear_filtering;
+  const bool old_cdrom_read_thread = m_settings.cdrom_read_thread;
+  std::array<ControllerType, NUM_CONTROLLER_AND_CARD_PORTS> old_controller_types = m_settings.controller_types;
 
   apply_callback();
 
-  if (m_settings.gpu_renderer != old_gpu_renderer)
-    SwitchGPURenderer();
-
-  if (m_settings.video_sync_enabled != old_vsync_enabled || m_settings.audio_sync_enabled != old_audio_sync_enabled ||
-      m_settings.speed_limiter_enabled != old_speed_limiter_enabled)
-  {
-    UpdateSpeedLimiterState();
-  }
-
   if (m_system)
   {
+    if (m_settings.gpu_renderer != old_gpu_renderer || m_settings.gpu_use_debug_device != old_gpu_debug_device)
+    {
+      ReportFormattedMessage("Switching to %s%s GPU renderer.", Settings::GetRendererName(m_settings.gpu_renderer),
+                             m_settings.gpu_use_debug_device ? " (debug)" : "");
+      RecreateSystem();
+    }
+
+    if (m_settings.audio_backend != old_audio_backend)
+    {
+      ReportFormattedMessage("Switching to %s audio backend.", Settings::GetAudioBackendName(m_settings.audio_backend));
+      DebugAssert(m_audio_stream);
+      m_audio_stream.reset();
+      CreateAudioStream();
+    }
+
+    if (m_settings.video_sync_enabled != old_vsync_enabled || m_settings.audio_sync_enabled != old_audio_sync_enabled ||
+        m_settings.speed_limiter_enabled != old_speed_limiter_enabled ||
+        m_settings.increase_timer_resolution != old_increase_timer_resolution)
+    {
+      UpdateSpeedLimiterState();
+    }
+
+    if (m_settings.emulation_speed != old_emulation_speed)
+    {
+      m_system->UpdateThrottlePeriod();
+      UpdateSpeedLimiterState();
+    }
+
     if (m_settings.cpu_execution_mode != old_cpu_execution_mode)
+    {
+      ReportFormattedMessage("Switching to %s CPU execution mode.",
+                             Settings::GetCPUExecutionModeName(m_settings.cpu_execution_mode));
       m_system->SetCPUExecutionMode(m_settings.cpu_execution_mode);
+    }
 
     if (m_settings.gpu_resolution_scale != old_gpu_resolution_scale ||
         m_settings.gpu_true_color != old_gpu_true_color ||
+        m_settings.gpu_scaled_dithering != old_gpu_scaled_dithering ||
         m_settings.gpu_texture_filtering != old_gpu_texture_filtering ||
-        m_settings.gpu_force_progressive_scan != old_gpu_force_progressive_scan)
+        m_settings.display_force_progressive_scan != old_display_force_progressive_scan ||
+        m_settings.display_crop_mode != old_display_crop_mode)
     {
       m_system->UpdateGPUSettings();
     }
+
+    if (m_settings.cdrom_read_thread != old_cdrom_read_thread)
+      m_system->GetCDROM()->SetUseReadThread(m_settings.cdrom_read_thread);
   }
 
-  if (m_settings.display_linear_filtering != old_display_linear_filtering)
+  for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
+  {
+    if (m_settings.controller_types[i] != old_controller_types[i])
+      OnControllerTypeChanged(i);
+  }
+
+  if (m_display && m_settings.display_linear_filtering != old_display_linear_filtering)
     m_display->SetDisplayLinearFiltering(m_settings.display_linear_filtering);
 }
 
@@ -633,73 +960,109 @@ void HostInterface::ToggleSoftwareRendering()
 
 void HostInterface::ModifyResolutionScale(s32 increment)
 {
-  const u32 new_resolution_scale =
-    std::clamp<u32>(static_cast<u32>(static_cast<s32>(m_settings.gpu_resolution_scale) + increment), 1,
-                    m_settings.max_gpu_resolution_scale);
+  const u32 new_resolution_scale = std::clamp<u32>(
+    static_cast<u32>(static_cast<s32>(m_settings.gpu_resolution_scale) + increment), 1, GPU::MAX_RESOLUTION_SCALE);
   if (new_resolution_scale == m_settings.gpu_resolution_scale)
     return;
 
   m_settings.gpu_resolution_scale = new_resolution_scale;
-  if (m_system)
-    m_system->GetGPU()->UpdateSettings();
-
   AddFormattedOSDMessage(2.0f, "Resolution scale set to %ux (%ux%u)", m_settings.gpu_resolution_scale,
                          GPU::VRAM_WIDTH * m_settings.gpu_resolution_scale,
                          GPU::VRAM_HEIGHT * m_settings.gpu_resolution_scale);
+
+  if (m_system)
+    m_system->GetGPU()->UpdateSettings();
 }
 
-void HostInterface::RunFrame()
+void HostInterface::RecreateSystem()
 {
-  m_frame_timer.Reset();
-  m_system->RunFrame();
-  UpdatePerformanceCounters();
+  std::unique_ptr<ByteStream> stream = ByteStream_CreateGrowableMemoryStream(nullptr, 8 * 1024);
+  if (!m_system->SaveState(stream.get()) || !stream->SeekAbsolute(0))
+  {
+    ReportError("Failed to save state before system recreation. Shutting down.");
+    DestroySystem();
+    return;
+  }
+
+  DestroySystem();
+
+  SystemBootParameters boot_params;
+  if (!BootSystem(boot_params))
+  {
+    ReportError("Failed to boot system after recreation.");
+    return;
+  }
+
+  if (!m_system->LoadState(stream.get()))
+  {
+    ReportError("Failed to load state after system recreation. Shutting down.");
+    DestroySystem();
+    return;
+  }
+
+  m_system->ResetPerformanceCounters();
 }
 
-void HostInterface::UpdatePerformanceCounters()
+void HostInterface::SetTimerResolutionIncreased(bool enabled)
 {
-  const float frame_time = static_cast<float>(m_frame_timer.GetTimeMilliseconds());
-  m_average_frame_time_accumulator += frame_time;
-  m_worst_frame_time_accumulator = std::max(m_worst_frame_time_accumulator, frame_time);
-
-  // update fps counter
-  const float time = static_cast<float>(m_fps_timer.GetTimeSeconds());
-  if (time < 1.0f)
+  if (m_timer_resolution_increased == enabled)
     return;
 
-  const float frames_presented = static_cast<float>(m_system->GetFrameNumber() - m_last_frame_number);
+  m_timer_resolution_increased = enabled;
 
-  m_worst_frame_time = m_worst_frame_time_accumulator;
-  m_worst_frame_time_accumulator = 0.0f;
-  m_average_frame_time = m_average_frame_time_accumulator / frames_presented;
-  m_average_frame_time_accumulator = 0.0f;
-  m_vps = static_cast<float>(frames_presented / time);
-  m_last_frame_number = m_system->GetFrameNumber();
-  m_fps = static_cast<float>(m_system->GetInternalFrameNumber() - m_last_internal_frame_number) / time;
-  m_last_internal_frame_number = m_system->GetInternalFrameNumber();
-  m_speed = static_cast<float>(static_cast<double>(m_system->GetGlobalTickCounter() - m_last_global_tick_counter) /
-                               (static_cast<double>(MASTER_CLOCK) * time)) *
-            100.0f;
-  m_last_global_tick_counter = m_system->GetGlobalTickCounter();
-  m_fps_timer.Reset();
-
-  OnPerformanceCountersUpdated();
+#ifdef WIN32
+  if (enabled)
+    timeBeginPeriod(1);
+  else
+    timeEndPeriod(1);
+#endif
 }
 
-void HostInterface::ResetPerformanceCounters()
+void HostInterface::DisplayLoadingScreen(const char* message, int progress_min /*= -1*/, int progress_max /*= -1*/,
+                                         int progress_value /*= -1*/)
 {
-  if (m_system)
+  const auto& io = ImGui::GetIO();
+  const float scale = io.DisplayFramebufferScale.x;
+  const float width = (400.0f * scale);
+  const bool has_progress = (progress_min < progress_max);
+
+  // eat the last imgui frame, it might've been partially rendered by the caller.
+  ImGui::EndFrame();
+  ImGui::NewFrame();
+
+  ImGui::SetNextWindowSize(ImVec2(width, (has_progress ? 50.0f : 30.0f) * scale), ImGuiCond_Always);
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                          ImVec2(0.5f, 0.5f));
+  if (ImGui::Begin("LoadingScreen", nullptr,
+                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing))
   {
-    m_last_frame_number = m_system->GetFrameNumber();
-    m_last_internal_frame_number = m_system->GetInternalFrameNumber();
-    m_last_global_tick_counter = m_system->GetGlobalTickCounter();
+    if (has_progress)
+    {
+      ImGui::Text("%s: %d/%d", message, progress_value, progress_max);
+      ImGui::ProgressBar(static_cast<float>(progress_value) / static_cast<float>(progress_max - progress_min),
+                         ImVec2(-1.0f, 0.0f), "");
+      Log_InfoPrintf("%s: %d/%d", message, progress_value, progress_max);
+    }
+    else
+    {
+      const ImVec2 text_size(ImGui::CalcTextSize(message));
+      ImGui::SetCursorPosX((width - text_size.x) / 2.0f);
+      ImGui::TextUnformatted(message);
+      Log_InfoPrintf("%s", message);
+    }
   }
-  else
-  {
-    m_last_frame_number = 0;
-    m_last_internal_frame_number = 0;
-    m_last_global_tick_counter = 0;
-  }
-  m_average_frame_time_accumulator = 0.0f;
-  m_worst_frame_time_accumulator = 0.0f;
-  m_fps_timer.Reset();
+  ImGui::End();
+
+  m_display->Render();
+}
+
+bool HostInterface::SaveResumeSaveState()
+{
+  if (!m_system)
+    return false;
+
+  const bool global = m_system->GetRunningCode().empty();
+  return SaveState(global, -1);
 }

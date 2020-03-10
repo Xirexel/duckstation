@@ -45,7 +45,7 @@ void GPU::ExecuteCommands()
   else if (command_ptr > m_GP0_buffer.data())
     m_GP0_buffer.erase(m_GP0_buffer.begin(), m_GP0_buffer.begin() + (command_ptr - m_GP0_buffer.data()));
 
-  UpdateGPUSTAT();
+  UpdateDMARequest();
 }
 
 void GPU::EndCommand()
@@ -417,13 +417,6 @@ bool GPU::HandleCopyRectangleVRAMToVRAMCommand(const u32*& command_ptr, u32 comm
 
   Log_DebugPrintf("Copy rectangle from VRAM to VRAM src=(%u,%u), dst=(%u,%u), size=(%u,%u)", src_x, src_y, dst_x, dst_y,
                   width, height);
-
-  if ((src_x + width) > VRAM_WIDTH || (src_y + height) > VRAM_HEIGHT || (dst_x + width) > VRAM_WIDTH ||
-      (dst_y + height) > VRAM_HEIGHT)
-  {
-    Panic("Out of bounds VRAM copy");
-    return true;
-  }
 
   FlushRender();
   CopyVRAM(src_x, src_y, dst_x, dst_y, width, height);
